@@ -39,11 +39,11 @@ except ImportError:                                 # pragma: no cover
 # ============================== CONFIG ======================================
 DEBUG = True                  # write a compact once-per-half-second trace to debug_log.txt (next to this file)
 DEBUG_TRUTH = False           # log the true pose if the robot node has supervisor TRUE (never used for control)
-USE_GESTURE_CONTROL = False   # True: laptop webcam PALM=stop / FIST=resume
+USE_GESTURE_CONTROL = True    # True: laptop webcam PALM=stop / FIST=resume
 MAP_DISPLAY = "map_display"    # name of a Display device (robot extensionSlot: Display { name "map_display" width 300 height 300 }):
                               # draws the live map, path, scan, targets. Does nothing when the world has no such Display. None = off
 MAP_PERIOD = 0.25             # [s] redraw period of that display (simulation time)
-MAP_SAVE = None               # debug: file name to save the display picture to (e.g. "map_view.png"), None = off
+MAP_SAVE = "map_view.png"     # debug: file name to save the display picture to (e.g. "map_view.png"), None = off
 MANUAL_KEYS = False           # True = WASD takes the wheels while a key is held (testing only; autonomy resumes when released)
 EXPECTED_TARGETS = None       # None = number of targets unknown -> explore everything reachable.
                               # int  = go home as soon as that many targets have been reached.
@@ -3238,9 +3238,13 @@ class Agent:
             except Exception as e:                                  # a bug in one step must never stop the robot for good
                 key = "%s:%s" % (type(e).__name__, str(e)[:60])
                 errs[key] = errs.get(key, 0) + 1
-                if errs[key] <= 3:
+                if errs[key] <= 3 or errs[key] % 200 == 0:          # if this keeps happening every tick, say so again once in a while
                     import traceback
-                    print("step error (%d): %s" % (errs[key], traceback.format_exc()))
+                    tb = traceback.format_exc()
+                    print("step error (%d): %s" % (errs[key], tb))
+                    if self.dbg_file:                               # so a long silent freeze is still visible in debug_log.txt afterwards
+                        self.dbg_file.write("[%6.1fs] step error (%d): %s\n" % (self.t, errs[key], tb))
+                        self.dbg_file.flush()
                 try:
                     self.brake()
                 except Exception:
