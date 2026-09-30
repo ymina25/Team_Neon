@@ -13,7 +13,8 @@ Pipeline (Perception -> Localization -> Mapping -> Planning -> Control)
   Localization  wheel odometry + gyro heading, corrected by LiDAR scan matching against the map
   Mapping       log-odds occupancy grid + a "camera coverage" grid (floor the camera has really looked at);
                 walking people are tracked and erased from the map when they leave
-  Global plan   frontier exploration, grid search on the inflated costmap (wide-clearance route first) + line-of-sight smoothing
+  Global plan   fixed local work area -> remaining frontiers / camera views -> continuous costmap A*
+                (finish nearby reachable work before selecting a new area; no diagonal corner cutting)
   Local plan    Dynamic Window Approach with the real footprint and predicted people
   Supervisor    EXPLORE (+ 360-degree SWEEPs) -> APPROACH -> DWELL -> ... -> LOOK -> RETURN -> ALIGN -> FINISH
                 + RECOVER and a fall-back chain so that the way home can never dead-lock
@@ -21,6 +22,8 @@ Pipeline (Perception -> Localization -> Mapping -> Planning -> Control)
 ON THE DAY change only the three lines under "ON THE DAY" below (time limit, target colour, number of targets).
 """
 import math
+import heapq
+import time
 from collections import deque
 
 import numpy as np
@@ -37,6 +40,7 @@ except ImportError:                                 # pragma: no cover
 # ============================== CONFIG ======================================
 DEBUG = True                  # write a compact once-per-half-second trace to debug_log.txt (next to this file)
 DEBUG_TRUTH = False           # log the true pose if the robot node has supervisor TRUE (never used for control)
+USE_GESTURE_CONTROL = False   # True: laptop webcam PALM=stop / FIST=resume
 MAP_DISPLAY = "map_display"    # name of a Display device (robot extensionSlot: Display { name "map_display" width 300 height 300 }):
                               # draws the live map, path, scan, targets. Does nothing when the world has no such Display. None = off
 MAP_PERIOD = 0.25             # [s] redraw period of that display (simulation time)
@@ -80,18 +84,44 @@ V_MAX, W_MAX = 1.2, 1.8       # [m/s], [rad/s]
 A_V, A_BRAKE, A_W = 1.5, 3.0, 4.0     # accel / brake / angular accel limits
 DW, SIM_DT, SIM_STEPS = 0.30, 0.25, 7 # DWA window [s], rollout step [s], rollout steps (1.75 s)
 PEOPLE_STEPS = 12             # people are predicted this many rollout steps ahead (3 s)
+PERSON_RADIUS = 0.30          # [m] conservative pedestrian body radius
+PERSON_MARGIN = 0.25          # [m] minimum robot-to-person surface gap
+PERSON_CAUTION = 1.20         # [m] start reducing speed inside this surface gap
+PERSON_STOP = 0.42            # [m] stop instead of squeezing past a close person
+PERSON_TRACK_TTL = 1.0        # [s] retain a briefly occluded pedestrian for local avoidance
+PERSON_UNCERTAINTY = 0.10     # [m] base allowance for tracking/prediction error
 MARGIN = 0.12                 # [m] minimum free space between footprint and obstacles (grows with speed)
 
 # --- mapping / planning
 RES = 0.10                    # [m] grid resolution
+FRONTIER_MIN_CELLS = 5        # discard small connected frontier regions
+FRONTIER_CHUNK = 2.0         # [m] split long boundaries into several observation destinations
+AREA_RADIUS = 4.0            # [m] walkable distance from a FIXED area anchor, not from each new goal
+AREA_FRONTIER_MIN = 2        # also finish small frontier remnants before leaving an area
+AREA_LOOK_GAIN = 0.5         # [m2] unseen camera floor worth checking before changing areas
+AREA_OBSERVE_RADIUS = 0.65   # [m] completed views with unchanged gain need not be repeated
+FRONTIER_SETBACK = 0.35       # [m] stand on known floor behind the frontier
+INFO_RADIUS = 3.0            # [m] visibility radius used to estimate new information
+GOAL_HOLD = 15.0             # [s] keep an accessible exploration goal at least this long
+COSTMAP_MARGIN = 0.02        # [m] fixed clearance beyond the robot's circumscribed footprint
+INFLATION_RANGE = 0.55       # [m] soft cost band outside the collision boundary
+INFLATION_WEIGHT = 4.0       # extra traversal cost near obstacles
+REVISIT_WEIGHT = 0.8         # extra traversal cost in repeatedly visited areas
+UNKNOWN_COST = 6.0          # only for explicit APPROACH / RETURN fallbacks
+GOAL_WEIGHTS = (2.0, 1.0, 1.5, 2.0)  # information gain, path cost, revisit, risk
+PATH_CHECK_PERIOD = 0.75     # [s] validate the route without selecting a new goal
+PATH_BLOCK_CONFIRM = 2.0    # [s] persistently blocked route before global replanning
 GX0, GY0 = -25.0, -25.0       # grid origin in the START frame (start = 0,0 facing +x)
 GW, GH = 500, 500             # 50 m x 50 m around the start
 LIDAR_USE = 12.0              # [m] max range used for mapping
 COV_RANGE = 7.0               # [m] how far the camera is trusted to spot a target (camera coverage map)
 LOOK_MIN = 500                # [cells] unseen floor (0.01 m2 each) that makes a far spot worth a 360-degree look
+MOVER_MIN_SPEED = 0.20         # [m/s] a tracked thing must move faster than this to count as a walking person (slow-people worlds: lower)
 SWEEP_MIN = 600               # [cells] same, for a quick look on the spot while exploring
 SWEEP_GAP = 5.0               # [m] minimum distance between two 360-degree looks
 SWEEP_W = 1.8                 # [rad/s] turn rate during a 360-degree look
+BLK_TTL = 100.0               # [s] a frontier the robot gave up on is tried again after this long
+MAX_SEARCH_PASSES = 3         # with EXPECTED_TARGETS set: how often the whole map is searched again when targets are still missing
 EXPLORE_MAX = None            # [s] hard cap on searching: after this the robot always heads home (None = EXPLORE_FRAC * TIME_LIMIT)
 EXPLORE_FRAC = 0.55           # share of TIME_LIMIT that may be spent searching (the trip home is budgeted separately)
 TRAVEL_V = None               # [m/s] typical driving speed used to estimate the way home (None = the lower of 0.6 and 85% of V_MAX)
@@ -110,9 +140,11 @@ CAM_LAG = 0.0                 # [s] the camera image is this much older than the
 # --- YOLO object detector (Ultralytics YOLO11n, runs on the CPU).  Used for the targets when the package and the model file are found;
 #     otherwise the rule-based colour detection above is used.
 USE_YOLO = False               # True = detect the targets with YOLO (apples / balls).  Off here: the boxes of the MiR / practice worlds are not COCO objects
+YOLO_DISPLAY = "yolo_display"  # Webots Display that shows the camera picture with ALL YOLO boxes, labels and confidences
+                              # (robot extensionSlot: Display { name "yolo_display" width 320 height 240 }); does nothing when the world has none. None = off
+YOLO_SAVE = None              # debug: file name to save the YOLO display picture to
 YOLO_MODEL = None             # path to yolo11n.pt.  None = look for ../../models/YOLO/yolo11n.pt (the competition layout), then next to this file
 YOLO_CLASSES = (32, 47, 49)   # COCO classes accepted as a target: 32 sports ball, 47 apple, 49 orange  (a small apple is often called 'sports ball').  None = all
-YOLO_DISPLAY = "yolo_display"  # Webots Display for all detected objects
 YOLO_CONF = 0.20              # minimum confidence
 YOLO_IMGSZ = 640              # network input size (a 10 cm apple is only ~15 px wide at 3.5 m: do not lower it)
 YOLO_RANGE = 4.0              # [m] detections farther than this are ignored (their distance is too uncertain)
@@ -133,7 +165,7 @@ COLOR_TABLE = {"red": (1.0, 0.0, 0.0), "orange": (1.0, 0.73, 0.0), "purple": (0.
 
 # ======================= TURTLEBOT3 BURGER PROFILE =========================
 # ---- ON THE DAY: edit these three -------------------------------------------------------------------------------
-TIME_LIMIT = 600.0            # [s] time the organizers give for the mission (the robot plans its trip home with it)
+TIME_LIMIT = 1500.0           # [s] time the organizers give for the mission (the robot plans its trip home with it; it goes home at once when EXPECTED_TARGETS are reached)
 TARGET_COLOR = "red"          # colour to rescue: "red" "green" "orange" "purple", several as ("red", "orange"), or "any"
 EXPECTED_TARGETS = 2          # two red apples: go home as soon as both are reached (None = unknown number -> explore everything)
 # ---- robot: TurtleBot3 Burger (Webots) --------------------------------------------------------------------------
@@ -156,12 +188,16 @@ SELF_MASK_M = 0.0
 LIDAR_USE = 3.5
 TARGET_LIDAR_VISIBLE = False  # apples are lower than the LiDAR plane
 GATE_MIN, GATE_K, GATE_REACHED = 0.30, 0.12, 0.30
-EXPLORE_FRAC = 0.80
+EXPLORE_FRAC = 0.88
 WP_TOL, WP_TOL_LAST, WP_TOL_HOME = 0.15, 0.08, 0.06
 LOOKAHEAD, DENSE_STEP = 0.5, 0.2
+MOVER_MIN_SPEED = 0.10        # the walking people in this world move at only 0.2 m/s
 NOVELTY_WIN = 100.0           # [s] go home when nothing new was seen for this long (slow robot: long)
-LOOK_BUDGET = 150.0
-FINE_BUDGET_OPEN = 120.0
+LOOK_BUDGET = 600.0           # [s] "go and look at floor the camera never saw": as long as it takes (the time budget still ends it)
+LOOK_MIN, SWEEP_MIN = 250, 400   # [cells of 0.01 m2] even a 2.5 m2 patch of never-seen floor is worth a trip / a 360-degree look
+FINE_MIN_OPEN, FINE_BUDGET_OPEN = 25, 600.0   # then every small unseen corner (0.25 m2) is visited too
+MAX_SEARCH_PASSES = 6         # both apples not found although everything was seen: forget what was 'seen' and go round the whole map again
+YOLO_COV_RANGE = 2.6          # floor counts as looked-at only within 2.6 m: the robot has to go INTO every room and corner
 USE_YOLO = True               # needs the ultralytics package and models/YOLO/yolo11n.pt; otherwise the colour detection is used
 # ===========================================================================
 import os as _os
@@ -184,7 +220,7 @@ elif isinstance(TARGET_COLOR, str):                     # "any"
 else:
     TARGET_LIST = [tuple(COLOR_TABLE[str(n).lower()]) if str(n).lower() in COLOR_TABLE else tuple(n) if not isinstance(n, str) else tuple(TARGET_RGB) for n in TARGET_COLOR]
     TARGET_RGB = TARGET_LIST[0]
-LEVELS = (2.0 * HW, 1.6 * HW, 1.3 * HW)          # obstacle inflation levels [m], widest first (scale with the robot half-width)
+COLLISION_RADIUS = math.hypot(HL, HW) + COSTMAP_MARGIN + RES / math.sqrt(2)
 
 
 def wrap(a):
@@ -237,23 +273,41 @@ def box_sum(mask, r):
     return c[np.ix_(i1, j1)] - c[np.ix_(i0, j1)] - c[np.ix_(i1, j0)] + c[np.ix_(i0, j0)]
 
 
+def grid_segment(a, b):
+    """Cells crossed between cell centres; include BOTH side cells at a corner."""
+    x, y = map(int, a)
+    tx, ty = map(int, b)
+    nx, ny = abs(tx - x), abs(ty - y)
+    sx, sy = (1 if tx > x else -1), (1 if ty > y else -1)
+    ix = iy = 0
+    cells = [(x, y)]
+    while ix < nx or iy < ny:
+        lhs, rhs = (1 + 2 * ix) * ny, (1 + 2 * iy) * nx
+        if lhs == rhs:
+            cells.extend(((x + sx, y), (x, y + sy)))
+            x, y, ix, iy = x + sx, y + sy, ix + 1, iy + 1
+        elif lhs < rhs:
+            x, ix = x + sx, ix + 1
+        else:
+            y, iy = y + sy, iy + 1
+        cells.append((x, y))
+    return cells
+
+
 def line_free(trav, a, b):
-    n = int(max(abs(b[0] - a[0]), abs(b[1] - a[1]))) + 1
-    xs = np.rint(np.linspace(a[0], b[0], n)).astype(int)
-    ys = np.rint(np.linspace(a[1], b[1], n)).astype(int)
-    return bool(trav[xs, ys].all())
+    return all(0 <= i < trav.shape[0] and 0 <= j < trav.shape[1] and trav[i, j]
+               for i, j in grid_segment(a, b))
 
 
 def smooth_cells(path, trav):
-    """Greedy line-of-sight shortcutting of a grid path."""
-    out, i = [path[0]], 0
-    while i < len(path) - 1:
-        j = min(len(path) - 1, i + 90)
-        while j > i + 1 and not line_free(trav, path[i], path[j]):
-            j -= 1
-        out.append(path[j])
-        i = j
-    return out
+    """Only remove collinear cells: never shortcut an A* route across costly cells."""
+    if len(path) < 3:
+        return list(path)
+    out = [path[0]]
+    for a, b, c in zip(path, path[1:], path[2:]):
+        if (b[0] - a[0], b[1] - a[1]) != (c[0] - b[0], c[1] - b[1]):
+            out.append(b)
+    return out + [path[-1]]
 
 
 def densify(origin, pts, step=None):
@@ -319,8 +373,11 @@ class Lidar:
 class Mapper:
     def __init__(self):
         self.L = np.zeros((GW, GH), np.float32)             # log-odds, exactly 0 = unknown
+        self.visits = np.zeros((GW, GH), np.float32)
+        self.last_visit = None
         self.ts = np.arange(0.15, LIDAR_USE, 0.08)
         self.blk = np.zeros((GW, GH), bool)                 # blacklisted frontier area
+        self.blk_log, self.now = [], 0.0                    # (time, x, y, r) of every blacklisting: they expire
         self.obs_pts = []                                   # centres of small objects below the LiDAR plane
         self.cov = np.zeros((GW, GH), bool)                 # floor the CAMERA has looked at
         self.vpvis = np.zeros((GW, GH), bool)               # floor that was in open view of a place where we did a 360-degree look
@@ -350,7 +407,9 @@ class Mapper:
         hx = ((sx + r * ca - GX0) / RES).astype(np.int32)
         hy = ((sy + r * sa - GY0) / RES).astype(np.int32)
         ok = hit & (hx >= 0) & (hx < GW) & (hy >= 0) & (hy < GH)
-        self.L[hx[ok], hy[ok]] += np.where(lid.dyn, 0.25, 1.0)[ok]     # moving things leave little trace
+        # Moving people belong to the local planner, not the static global costmap.
+        ok &= ~lid.dyn
+        self.L[hx[ok], hy[ok]] += 1.0
         np.clip(self.L, -4.0, 4.0, out=self.L)
 
     def mark_cov(self, ox, oy, yaw, offs, rng):
@@ -390,39 +449,153 @@ class Mapper:
         return (max(min(il) - pad, 2), min(max(il) + pad + 1, GW - 2),
                 max(min(jl) - pad, 2), min(max(jl) + pad + 1, GH - 2))
 
-    def derive(self, win, rx, ry, radius_m, unknown_ok=False):
-        """Traversable + frontier masks inside the window."""
+    def record_visit(self, x, y):
+        """Count entries into cells, not time spent waiting; soften counts over 30 cm."""
+        ix, iy = self.cell(x, y)
+        if not self.inside(ix, iy) or self.last_visit == (ix, iy):
+            return
+        self.last_visit = (ix, iy)
+        r = max(1, int(round(0.3 / RES)))
+        a, b = max(0, ix - r), max(0, iy - r)
+        c, d = min(GW, ix + r + 1), min(GH, iy + r + 1)
+        dist = np.hypot(np.arange(a, c)[:, None] - ix, np.arange(b, d)[None, :] - iy)
+        self.visits[a:c, b:d] += np.maximum(0.0, 1.0 - dist / (r + 1))
+        # The robot has physically observed its own occupied floor, never clear an obstacle.
+        foot = (np.abs(self.cx[a:c, None] - x) < min(HL, HW)) & \
+               (np.abs(self.cy[None, b:d] - y) < min(HL, HW))
+        tile = self.L[a:c, b:d]
+        tile[foot & (tile == 0)] = -0.4
+
+    def costmap(self, win, unknown_ok=False):
+        """Fixed collision boundary and continuous inflation/revisit costs (no radius relaxation)."""
+        import cv2
         i0, i1, j0, j1 = win
         L = self.L[i0:i1, j0:j1]
-        occ = L > 1.0
-        for ox, oy in self.obs_pts:                         # small objects the LiDAR cannot see (apples on the floor)
+        occ = (L > 0.5).copy()
+        for ox, oy in self.obs_pts:
             a, b = self.cell(ox, oy)
             if i0 <= a < i1 and j0 <= b < j1:
                 occ[a - i0, b - j0] = True
-        ix, iy = self.cell(rx, ry)
-        ix, iy = ix - i0, iy - j0
-        a0, b0 = max(ix - 8, 0), max(iy - 8, 0)
-        sub = occ[a0:ix + 9, b0:iy + 9]
-        if sub.any() and radius_m > 0.35:                   # big robot already close to something: shrink (a small one just uses the free patch below)
-            ii, jj = np.nonzero(sub)
-            d_occ = float(np.hypot(ii + a0 - ix, jj + b0 - iy).min()) * RES
-            radius_m = clip(min(radius_m, d_occ - 0.03), min(0.35, LEVELS[-1]), radius_m)      # (the floor scales with the robot)
-        infl = dilate(occ, int(round(radius_m / RES)))
-        free = (L <= 0.5) if unknown_ok else (L < -0.25)
-        trav = free & ~infl
-        trav[max(ix - 3, 0):ix + 4, max(iy - 3, 0):iy + 4] = True     # always let the robot leave its spot
-        trav[[0, -1], :] = False
-        trav[:, [0, -1]] = False
+        # Padding treats the edge of the planning window as a wall.
+        clear = cv2.distanceTransform(np.pad((~occ).astype(np.uint8), 1),
+                                      cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1] * RES
+        hard = clear <= COLLISION_RADIUS
+        risk = np.clip(1.0 - (clear - COLLISION_RADIUS) / INFLATION_RANGE, 0.0, 1.0) ** 2
+        revisit = np.minimum(np.log1p(self.visits[i0:i1, j0:j1]) / 3.0, 1.0)
+        free = L < -0.25
+        allowed = ((L <= 0.5) if unknown_ok else free) & ~hard
+        cost = 1.0 + INFLATION_WEIGHT * risk + REVISIT_WEIGHT * revisit
+        if unknown_ok:
+            cost = cost + UNKNOWN_COST * ~free
+        cost = np.where(allowed, cost, np.inf)
         unk = L == 0
-        un = np.zeros_like(unk)
-        un[1:, :] |= unk[:-1, :]
-        un[:-1, :] |= unk[1:, :]
-        un[:, 1:] |= unk[:, :-1]
-        un[:, :-1] |= unk[:, 1:]
-        fr = trav & un & ~self.blk[i0:i1, j0:j1]
-        if fr.any():
-            fr &= count_nb(fr, 2) >= 4                      # ignore isolated 1-2 cell "frontiers"
-        return trav, fr
+        adjacent = np.zeros_like(unk)
+        adjacent[1:] |= unk[:-1]
+        adjacent[:-1] |= unk[1:]
+        adjacent[:, 1:] |= unk[:, :-1]
+        adjacent[:, :-1] |= unk[:, 1:]
+        frontier = free & ~hard & adjacent & ~self.blk[i0:i1, j0:j1]
+        return dict(win=win, cost=cost, risk=risk, revisit=revisit, hard=hard,
+                    occupied=occ, free=free, frontier=frontier, clearance=clear)
+
+    @staticmethod
+    def regions(mask, minimum=FRONTIER_MIN_CELLS):
+        """8-connected frontier regions; isolated pixels are not exploration goals."""
+        import cv2
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+        return [np.argwhere(labels == k) for k in range(1, n)
+                if stats[k, cv2.CC_STAT_AREA] >= minimum]
+
+    def information_gain(self, cell, nav, floor_only=False, scope=None):
+        """Visible unknown area (m2); known walls occlude rays. LOOK uses unseen free floor."""
+        i0, i1, j0, j1 = nav["win"]
+        L = self.L[i0:i1, j0:j1]
+        angles = np.linspace(0.0, 2 * math.pi, 120, endpoint=False)
+        distances = np.arange(0.0, INFO_RADIUS / RES, 0.5)
+        ii = np.rint(cell[0] + np.cos(angles)[:, None] * distances).astype(int)
+        jj = np.rint(cell[1] + np.sin(angles)[:, None] * distances).astype(int)
+        inside = (ii >= 0) & (ii < L.shape[0]) & (jj >= 0) & (jj < L.shape[1])
+        ii, jj = np.clip(ii, 0, L.shape[0] - 1), np.clip(jj, 0, L.shape[1] - 1)
+        hit = nav["occupied"][ii, jj] | ~inside
+        visible = (np.cumsum(hit, axis=1) == 0) & inside
+        wanted = (L < -0.25) & ~self.cov[i0:i1, j0:j1] if floor_only else (L == 0)
+        if scope is not None:
+            wanted = wanted & scope
+        visible &= wanted[ii, jj]
+        return float(len(np.unique(ii[visible] * L.shape[1] + jj[visible]))) * RES ** 2
+
+    @staticmethod
+    def area_mask(nav, cell, radius=AREA_RADIUS):
+        """Local work area by walkable distance; walls and blocked diagonals separate areas."""
+        allowed = np.isfinite(nav["cost"])
+        distance = np.full(allowed.shape, np.inf)
+        i, j = cell
+        if not (0 <= i < allowed.shape[0] and 0 <= j < allowed.shape[1]) or not allowed[i, j]:
+            return np.zeros_like(allowed)
+        distance[i, j] = 0.0
+        queue = [(0.0, i, j)]
+        while queue:
+            d, i, j = heapq.heappop(queue)
+            if d > distance[i, j]:
+                continue
+            for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1),
+                           (-1, -1), (-1, 1), (1, -1), (1, 1)):
+                ni, nj = i + di, j + dj
+                nd = d + RES * (math.sqrt(2) if di and dj else 1.0)
+                if nd > radius or not (0 <= ni < allowed.shape[0] and 0 <= nj < allowed.shape[1]):
+                    continue
+                if not allowed[ni, nj] or nd >= distance[ni, nj]:
+                    continue
+                if di and dj and not (allowed[i, nj] and allowed[ni, j]):
+                    continue
+                distance[ni, nj] = nd
+                heapq.heappush(queue, (nd, ni, nj))
+        return np.isfinite(distance)
+
+    def frontier_candidates(self, nav, minimum=FRONTIER_MIN_CELLS, scope=None):
+        """Safe representatives along each connected frontier, including long boundary sections."""
+        import cv2
+        cost, fr = nav["cost"], nav["frontier"]
+        i0, i1, j0, j1 = nav["win"]
+        usable = np.isfinite(cost) & ~self.blk[i0:i1, j0:j1]
+        if scope is not None:
+            fr, usable = fr & scope, usable & scope
+        candidates = []
+        regions = []
+        chunk = max(1, int(round(FRONTIER_CHUNK / RES)))
+        for region in self.regions(fr, minimum=minimum):
+            # Stable world-grid tiles keep one long boundary from having only one goal.
+            tiles = (region + [i0, j0]) // chunk
+            for tile in np.unique(tiles, axis=0):
+                cells = region[np.all(tiles == tile, axis=1)]
+                regions.append(cells)             # preserve short ends of an otherwise valid region
+        for cells in regions:
+            # Limit the distance transform to this region's neighbourhood.
+            pad = int(math.ceil(FRONTIER_SETBACK / RES)) + 2
+            lo = np.maximum(cells.min(axis=0) - pad, 0)
+            hi = np.minimum(cells.max(axis=0) + pad + 1, cost.shape)
+            sl = (slice(lo[0], hi[0]), slice(lo[1], hi[1]))
+            mask = np.ones((hi - lo).tolist(), np.uint8)
+            loc = cells - lo
+            mask[loc[:, 0], loc[:, 1]] = 0
+            dist = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE) * RES
+            options = np.argwhere(usable[sl] & (dist <= FRONTIER_SETBACK))
+            if not len(options):
+                continue
+            choices = options + lo
+            centre = cells.mean(axis=0)
+            # Prefer a setback and low risk, then the centre of the region.
+            rank = (2.0 * nav["risk"][choices[:, 0], choices[:, 1]]
+                    + np.abs(dist[options[:, 0], options[:, 1]] - FRONTIER_SETBACK)
+                    + 0.05 * np.linalg.norm(choices - centre, axis=1) * RES)
+            for k in np.argsort(rank):
+                cell = tuple(map(int, choices[k]))
+                nearest = cells[np.argmin(np.linalg.norm(cells - choices[k], axis=1))]
+                if line_free(usable, cell, nearest):
+                    candidates.append(dict(cell=cell, region=cells, kind="EXPLORE",
+                                           gain=self.information_gain(cell, nav)))
+                    break
+        return candidates
 
     def unseen_around(self, x, y, rng=COV_RANGE):
         """Known-free floor within `rng` that the camera has never looked at (number of cells)."""
@@ -440,32 +613,74 @@ class Mapper:
     def blacklist(self, x, y, r=7):
         ix, iy = self.cell(x, y)
         self.blk[max(ix - r, 0):ix + r + 1, max(iy - r, 0):iy + r + 1] = True
+        self.blk_log.append((self.now, x, y, r))
+
+    def expire_blk(self, ttl):
+        """A frontier that was given up on (stuck, too far, a person in the way) is tried again after `ttl` seconds."""
+        if not self.blk_log or self.now - self.blk_log[0][0] < ttl:
+            return
+        keep = [e for e in self.blk_log if self.now - e[0] < ttl]
+        self.blk[:] = False
+        self.blk_log = []
+        for _, x, y, r in keep:
+            self.blacklist(x, y, r)
+        self.blk_log = [(e[0], e[1], e[2], e[3]) for e in keep]
 
     @staticmethod
-    def bfs(trav, start, goal):
-        """8-connected BFS from start (i, j) to the nearest goal cell (arrays are window-local)."""
-        W, H = trav.shape
-        tv = bytearray(trav.astype(np.uint8).ravel().tobytes())
-        gv = bytearray(goal.astype(np.uint8).ravel().tobytes())
-        s = start[0] * H + start[1]
-        prev = [-2] * (W * H)
-        prev[s] = -1
-        nb = (1, -1, H, -H, H + 1, H - 1, -H + 1, -H - 1)
-        dq = deque([s])
-        while dq:
-            u = dq.popleft()
-            if gv[u] and u != s:
+    def astar(cost, start, goals):
+        """Weighted 8-neighbour A*. Euclidean distance to the goal set is admissible."""
+        W, H = cost.shape
+        goals = np.asarray(goals, dtype=int).reshape(-1, 2)
+        if not (0 <= start[0] < W and 0 <= start[1] < H) or not np.isfinite(cost[start]):
+            return None, math.inf
+        inside = (goals[:, 0] >= 0) & (goals[:, 0] < W) & (goals[:, 1] >= 0) & (goals[:, 1] < H)
+        goals = goals[inside]
+        goals = goals[np.isfinite(cost[goals[:, 0], goals[:, 1]])]
+        if not len(goals):
+            return None, math.inf
+        targets = {int(i * H + j) for i, j in goals}
+        # One distance transform gives the exact Euclidean heuristic for many goal cells.
+        import cv2
+        mask = np.ones((W, H), np.uint8)
+        mask[goals[:, 0], goals[:, 1]] = 0
+        heuristic = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE) * RES
+        # Round down slightly to keep floating-point distanceTransform values admissible.
+        heuristic = np.maximum(0, heuristic - 1e-5)
+        weights = cost.ravel().tolist()
+        heur = heuristic.ravel().tolist()
+        root = start[0] * H + start[1]
+        distance, prev = [math.inf] * (W * H), [-1] * (W * H)
+        distance[root] = 0.0
+        queue = [(heur[root], 0.0, root)]
+        moves = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
+                 (1, 1, math.sqrt(2)), (1, -1, math.sqrt(2)),
+                 (-1, 1, math.sqrt(2)), (-1, -1, math.sqrt(2)))
+        while queue:
+            _, g, u = heapq.heappop(queue)
+            if g > distance[u] + 1e-9:
+                continue
+            if u in targets:
                 path = []
                 while u != -1:
                     path.append((u // H, u % H))
                     u = prev[u]
-                return path[::-1]
-            for d in nb:
-                v = u + d
-                if 0 <= v < W * H and prev[v] == -2 and tv[v]:
-                    prev[v] = u
-                    dq.append(v)
-        return None
+                return path[::-1], g
+            i, j = divmod(u, H)
+            for di, dj, length in moves:
+                ni, nj = i + di, j + dj
+                if not (0 <= ni < W and 0 <= nj < H):
+                    continue
+                v = ni * H + nj
+                if not math.isfinite(weights[v]):
+                    continue
+                if di and dj and (not math.isfinite(weights[(i + di) * H + j])
+                                  or not math.isfinite(weights[i * H + j + dj])):
+                    continue
+                ng = g + length * RES * 0.5 * (weights[u] + weights[v])
+                if ng + 1e-9 < distance[v]:
+                    distance[v], prev[v] = ng, u
+                    heapq.heappush(queue, (ng + heur[v], ng, v))
+        return None, math.inf
 
     def dump_pgm(self, path, robot, path_pts, extra=()):
         """Debug picture around the known area: free=254, unknown=128, occupied=0, camera-unseen free=230,
@@ -548,6 +763,17 @@ class Agent:
         self.state, self.prev_state = "EXPLORE", "EXPLORE"
         self.path, self.goal_xy = [], None
         self.goal_pick_t = -99.0
+        self.goal_kind, self.goal_info = None, None
+        self.goal_candidates, self.frontier_regions = [], []
+        self.frontier_win = None
+        self.area_anchor, self.area_serial = None, 0
+        self.area_mask, self.area_win = None, None
+        self.frontier_observations = []
+        self.nav, self.nav_t, self.nav_unknown = None, -99.0, False
+        self.plan_unknown = False
+        self.path_obstructed_since = None
+        self.local_trajectory = np.zeros((0, 2))
+        self.person_hold = False
         self.arrived = False
         self.last_plan, self.goal_t0 = -99.0, 0.0
         self.targets = []                                   # dicts: p, hits, seen, range, status
@@ -557,6 +783,7 @@ class Agent:
         self.nudge_until = 0.0
         self.manual_on = False
         self.tight_fail = 0
+        self.search_pass = 0
         self.dwell_until = self.align_until = 0.0
         self.recover_until, self.recover_dir = 0.0, 1.0
         self.stuck_events = deque()
@@ -602,6 +829,7 @@ class Agent:
         self.persons, self.pers_hit, self.min_pdist = [], False, 9.0
         self.tnodes = []
         self.dump_t = -99.0
+        self.setup_gesture_control()
         if DEBUG:
             try:
                 self.dbg_file = open("debug_log.txt", "w")
@@ -731,45 +959,6 @@ class Agent:
             print("YOLO: %s loaded (classes %s, conf >= %.2f, range <= %.1f m)" % (_os.path.normpath(path), YOLO_CLASSES, YOLO_CONF, YOLO_RANGE))
         except Exception as e:
             print("YOLO: could not run the model (%s) -> using colour detection" % e)
-
-    def setup_yolo_display(self, robot):
-        self.ydisp = None
-        if not YOLO_DISPLAY or self.yolo is None:
-            return
-        names = [robot.getDeviceByIndex(i).getName() for i in range(robot.getNumberOfDevices())]
-        if YOLO_DISPLAY not in names:
-            print("YOLO display missing: reload apartment.wbt to load yolo_display")
-            return
-        self.ydisp = robot.getDevice(YOLO_DISPLAY)
-        print("YOLO display '%s': all detected classes, labels and confidence" % YOLO_DISPLAY)
-
-    def update_yolo_display(self, result):
-        """Display the inference frame before filtering navigation targets."""
-        if self.ydisp is None:
-            return
-        try:
-            from controller import Display
-            frame = result.plot(labels=True, conf=True, boxes=True, line_width=2)
-            # Fit the entire camera frame into the Display, preserving aspect ratio.
-            import cv2
-            dw, dh = self.ydisp.getWidth(), self.ydisp.getHeight()
-            fh, fw = frame.shape[:2]
-            scale = min(dw / fw, dh / fh)
-            width, height = max(1, round(fw * scale)), max(1, round(fh * scale))
-            resized = cv2.resize(frame, (width, height),
-                                 interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
-            canvas = np.zeros((dh, dw, 3), dtype=np.uint8)
-            left, top = (dw - width) // 2, (dh - height) // 2
-            canvas[top:top + height, left:left + width] = resized
-            rgb = np.ascontiguousarray(canvas[..., ::-1])
-            ref = self.ydisp.imageNew(rgb.tobytes(), Display.RGB, dw, dh)
-            try:
-                self.ydisp.imagePaste(ref, 0, 0, False)
-            finally:
-                self.ydisp.imageDelete(ref)
-        except Exception as e:
-            print("YOLO display off (%r)" % (e,))
-            self.ydisp = None
 
     def init_heading(self):
         self._gyro_yaw = 0.0
@@ -1089,6 +1278,13 @@ class Agent:
         for m in self.motors_r:
             m.setVelocity(vr)
         self.v, self.w = v, w
+        # Predict the command actually sent to the wheels, including motor saturation.
+        actual_v = WHEEL_R * (vl + vr) / 2
+        actual_w = WHEEL_R * (vr - vl) / TRACK_CMD * self.wgain
+        angles = self.yaw + actual_w * SIM_DT * (np.arange(SIM_STEPS) + 0.5)
+        self.local_trajectory = np.vstack(([self.x, self.y],
+            np.column_stack((self.x + np.cumsum(actual_v * np.cos(angles) * SIM_DT),
+                             self.y + np.cumsum(actual_v * np.sin(angles) * SIM_DT)))))
 
     def brake(self):
         dt = 2 * self.dt / 1000.0
@@ -1166,10 +1362,12 @@ class Agent:
                     if dd < bd:
                         best, bd = tr, dd
                 if best is None:
-                    self.tracks.append(dict(x=cx, y=cy, hist=deque([(t, cx, cy)]), v=(0.0, 0.0), seen=t, born=t, disp=0.0))
+                    self.tracks.append(dict(x=cx, y=cy, hist=deque([(t, cx, cy)]), v=(0.0, 0.0),
+                                            seen=t, born=t, disp=0.0, hits=1))
                     self.dlog("new moving-object track at (%.1f, %.1f) n=%d dist=%.1f" % (cx, cy, c_[2], self.dist((cx, cy))))
                     continue
                 best["x"], best["y"], best["seen"] = cx, cy, t
+                best["hits"] = best.get("hits", 1) + 1
                 h = best["hist"]
                 h.append((t, cx, cy))
                 while h and t - h[0][0] > 1.0:
@@ -1186,14 +1384,45 @@ class Agent:
     def moving_tracks(self):
         """People that are really walking: seen just now, tracked for a while, and they have actually travelled."""
         return [tr for tr in self.tracks if self.t - tr["seen"] < 0.4 and self.t - tr["born"] >= 0.2
-                and math.hypot(*tr["v"]) > 0.2]
+                and math.hypot(*tr["v"]) > MOVER_MIN_SPEED]
+
+    def pedestrian_tracks(self):
+        """Recent dynamic objects for safety, including people before velocity is established."""
+        out = []
+        for tr in self.tracks:
+            age = self.t - tr["seen"]
+            if age >= PERSON_TRACK_TTL:
+                continue
+            distance = self.dist((tr["x"], tr["y"]))
+            if tr.get("hits", 1) < 2 and distance > 1.2:
+                continue                                      # reject a single far scan-change cluster
+            mature = self.t - tr["born"] >= 0.2 and tr.get("hits", 1) >= 2
+            vx, vy = tr["v"] if mature else (0.0, 0.0)
+            out.append(dict(x=tr["x"] + vx * age, y=tr["y"] + vy * age,
+                            vx=vx, vy=vy, uncertain=PERSON_UNCERTAINTY + 0.08 * age,
+                            source=tr))
+        return out
+
+    def nearest_person_gap(self, tracks=None):
+        """Surface gap from our rectangular footprint to the nearest tracked pedestrian."""
+        tracks = self.pedestrian_tracks() if tracks is None else tracks
+        if not tracks:
+            return 9.0
+        c, s = math.cos(self.yaw), math.sin(self.yaw)
+        gap = 9.0
+        for tr in tracks:
+            dx, dy = tr["x"] - self.x, tr["y"] - self.y
+            xr, yr = c * dx + s * dy, -s * dx + c * dy
+            d = math.hypot(max(abs(xr) - HL, 0.0), max(abs(yr) - HW, 0.0))
+            gap = min(gap, d - PERSON_RADIUS - tr["uncertain"])
+        return gap
 
     def movers(self):
         """Walking people we have seen in the last 2.5 s: (x, y, vx, vy) extrapolated to now."""
         out = []
         for tr in self.tracks:
             age = self.t - tr["seen"]
-            if age < 2.5 and math.hypot(*tr["v"]) > 0.2 and self.t - tr["born"] >= 0.2:
+            if age < 2.5 and math.hypot(*tr["v"]) > MOVER_MIN_SPEED and self.t - tr["born"] >= 0.2:
                 out.append((tr["x"] + tr["v"][0] * age, tr["y"] + tr["v"][1] * age, tr["v"][0], tr["v"][1]))
         return out
 
@@ -1406,20 +1635,26 @@ class Agent:
             return out
         img = np.frombuffer(self.cam.getImage(), np.uint8).reshape(self.ch, self.cw, 4)
         rgbf = img[..., 2::-1].astype(np.float32)                  # RGB
+        show = self.ydisp is not None                               # a YOLO picture is wanted: run the detector on every frame
+        if TARGET_LIST and not show:                                # cheap pre-check: no pixel of the wanted colour anywhere -> nothing to find
+            small = rgbf[::2, ::2]
+            if int((self.colour_match(small, 0.6) & (small.sum(axis=-1) > 60)).sum()) < 3:
+                return out
         self.yolo_t = self.t
         bgr = np.ascontiguousarray(img[..., :3])
         try:
             res = self.yolo.predict(source=bgr, imgsz=YOLO_IMGSZ, conf=YOLO_CONF, iou=0.5, verbose=False, device="cpu",
-                                    classes=None)[0]
+                                    classes=None if (show or not YOLO_CLASSES) else list(YOLO_CLASSES))[0]
         except Exception as e:
             self.dlog("YOLO failed: %s" % e)
             return out
         self.yolo_n += 1
-        self.update_yolo_display(res)
+        if show:
+            self.update_yolo_display(res, bgr, rgbf)
         moving = self.contact_t is not None or self.t - self.contact_last < 1.5 or self.t - self.flung_t < 2.0
         for b in res.boxes:
             if YOLO_CLASSES and int(b.cls[0]) not in YOLO_CLASSES:
-                continue  # Display all classes, but keep navigation target filtering.
+                continue                                            # (shown on the display, but not a possible target)
             conf = float(b.conf[0])
             x1, y1, x2, y2 = [float(v) for v in b.xyxy[0]]
             w, h = x2 - x1, y2 - y1
@@ -1592,8 +1827,7 @@ class Agent:
             dr = math.hypot(rx - self.cand["p"][0], ry - self.cand["p"][1])
             return trav & (dd > min(0.45, HL + 0.1)) & (dd < min(2.0, dr - 0.3))
         dd = np.hypot(X, Y)                                     # RETURN
-        g = trav & (dd < 0.8)
-        return g if g.any() else trav & (dd < 1.6)
+        return trav & (dd < START_RADIUS * 0.75)
 
     def plan(self, kind, t, unknown_ok=False):
         if kind == "APPROACH" and not unknown_ok:
@@ -1607,79 +1841,185 @@ class Agent:
         self.appr_fb = False
         return self._plan(kind, t, unknown_ok)
 
+    def refresh_nav(self, unknown_ok=None, force=False):
+        """Static map snapshot shared by A*, validation and the map overlay."""
+        unknown_ok = self.plan_unknown if unknown_ok is None else unknown_ok
+        if not force and self.nav is not None and self.t - self.nav_t < PATH_CHECK_PERIOD \
+                and unknown_ok == self.nav_unknown:
+            return self.nav
+        self.map.obs_pts = self.active_obs()
+        extra = [(self.x, self.y), (0.0, 0.0)] + list(self.path)
+        if self.goal_xy is not None:
+            extra.append(self.goal_xy)
+        if self.cand is not None:
+            extra.append(self.cand["p"])
+        self.nav = self.map.costmap(self.map.window(extra), unknown_ok)
+        self.nav_t, self.nav_unknown = self.t, unknown_ok
+        return self.nav
+
+    def observed_frontier(self, candidate, nav):
+        """A completed view is retried only when the map exposes additional information."""
+        i0, _, j0, _ = nav["win"]
+        p = self.map.center(candidate["cell"][0] + i0, candidate["cell"][1] + j0)
+        key = "floor_gain" if candidate.get("floor_only") else "gain"
+        return any(math.dist(p, v["p"]) < AREA_OBSERVE_RADIUS and candidate["gain"] <= v[key] + 0.25
+                   for v in self.frontier_observations)
+
+    def area_view_candidates(self, nav, scope):
+        """Camera coverage cleanup inside the current area, after its frontiers are exhausted."""
+        i0, i1, j0, j1 = nav["win"]
+        unseen = nav["free"] & ~self.map.cov[i0:i1, j0:j1] & scope
+        if unseen.sum() * RES ** 2 < AREA_LOOK_GAIN:
+            return []
+        usable = scope & np.isfinite(nav["cost"]) & ~self.map.blk[i0:i1, j0:j1]
+        cells = np.argwhere(usable)
+        if not len(cells):
+            return []
+        stride = max(1, int(round(1.0 / RES)))
+        tiles = (cells + [i0, j0]) // stride
+        candidates = []
+        for tile in np.unique(tiles, axis=0):
+            options = cells[np.all(tiles == tile, axis=1)]
+            rank = nav["cost"][options[:, 0], options[:, 1]] + 0.01 * np.linalg.norm(options - options.mean(axis=0), axis=1)
+            cell = tuple(map(int, options[np.argmin(rank)]))
+            gain = self.map.information_gain(cell, nav, floor_only=True, scope=scope)
+            if gain >= AREA_LOOK_GAIN:
+                candidates.append(dict(cell=cell, gain=gain, floor_only=True, region=options, kind="LOOK"))
+        return candidates
+
+    def score_exploration_candidates(self, candidates, nav, start):
+        """Score within one priority tier; distant areas cannot outbid local remaining work."""
+        cost = nav["cost"]
+        self.goal_candidates.extend(candidates)
+        wg, wp, wv, wr = GOAL_WEIGHTS
+        for c in candidates:
+            cell = c["cell"]
+            c["revisit"] = float(nav["revisit"][cell])
+            direct = math.hypot(cell[0] - start[0], cell[1] - start[1]) * RES
+            # The remaining path revisit and risk penalties are non-negative.
+            c["upper"] = wg * c["gain"] - wp * direct - wv * c["revisit"]
+        best, best_path, best_score = None, None, -math.inf
+        for c in sorted(candidates, key=lambda c: c["upper"], reverse=True):
+            if c["upper"] < best_score:
+                break
+            if c["gain"] <= 0 or math.hypot(c["cell"][0] - start[0], c["cell"][1] - start[1]) * RES < 0.25 \
+                    or self.observed_frontier(c, nav):
+                continue
+            path, value = Mapper.astar(cost, start, [c["cell"]])
+            if path is None:
+                c["reachable"] = False
+                continue
+            idx = np.asarray(path, dtype=int)
+            risk = float(nav["risk"][idx[:, 0], idx[:, 1]].mean())
+            revisit = c["revisit"] + float(nav["revisit"][idx[:, 0], idx[:, 1]].mean())
+            score = wg * c["gain"] - wp * value - wv * revisit - wr * risk
+            c.update(reachable=True, path_cost=value, revisit=revisit, risk=risk, score=score)
+            if score > best_score:
+                best, best_path, best_score = c, path, score
+        return best_path, best
+
+    def select_exploration_goal(self, kind, nav, start, X, Y):
+        """Finish reachable work around a fixed area anchor before choosing another area."""
+        i0, i1, j0, j1 = nav["win"]
+        self.frontier_regions = self.map.regions(nav["frontier"], minimum=AREA_FRONTIER_MIN)
+        self.frontier_win, self.goal_candidates = nav["win"], []
+        if self.area_anchor is not None:
+            ai, aj = self.map.cell(*self.area_anchor)
+            self.area_mask = self.map.area_mask(nav, (ai - i0, aj - j0))
+            self.area_win = nav["win"]
+        else:
+            self.area_mask, self.area_win = None, None
+
+        if kind == "EXPLORE":
+            if self.area_mask is not None and self.area_mask.any():
+                local = self.map.frontier_candidates(nav, minimum=AREA_FRONTIER_MIN, scope=self.area_mask)
+                path, best = self.score_exploration_candidates(local, nav, start)
+                if best is None:
+                    local = self.area_view_candidates(nav, self.area_mask)
+                    path, best = self.score_exploration_candidates(local, nav, start)
+                if best is not None:
+                    best["area"] = self.area_serial
+                    return path, best
+            candidates = self.map.frontier_candidates(nav, minimum=AREA_FRONTIER_MIN)
+            if self.area_mask is not None:
+                candidates = [c for c in candidates if not self.area_mask[c["cell"]]]
+        else:
+            mask = self.goal_mask("LOOK", np.isfinite(nav["cost"]), nav["frontier"], X, Y, nav["win"])
+            mask &= ~self.map.blk[i0:i1, j0:j1]
+            candidates = []
+            for cells in Mapper.regions(mask, minimum=1):
+                centre = cells.mean(axis=0)
+                rank = nav["cost"][cells[:, 0], cells[:, 1]] + 0.1 * np.linalg.norm(cells - centre, axis=1)
+                cell = tuple(map(int, cells[int(np.argmin(rank))]))
+                candidates.append(dict(cell=cell, region=cells, kind=kind, floor_only=True,
+                                       gain=self.map.information_gain(cell, nav, floor_only=True)))
+        path, best = self.score_exploration_candidates(candidates, nav, start)
+        if best is not None:
+            if self.area_anchor is not None:
+                self.log("area %d: no remaining reachable unobserved candidates -> next area" % self.area_serial)
+            self.area_anchor = self.map.center(best["cell"][0] + i0, best["cell"][1] + j0)
+            self.area_serial += 1
+            self.area_mask = self.map.area_mask(nav, best["cell"])
+            self.area_win = nav["win"]
+            best["area"] = self.area_serial
+            self.log("area %d anchored at (%.1f, %.1f): finish nearby frontiers and camera coverage first"
+                     % (self.area_serial, *self.area_anchor))
+        return path, best
+
     def _plan(self, kind, t, unknown_ok=False):
         self.last_plan = t
-        self.map.obs_pts = self.active_obs()
         rx, ry = self.x, self.y
         if not self.map.inside(*self.map.cell(rx, ry)):
             return False
-        extra = [(rx, ry), (0.0, 0.0)] + ([self.cand["p"]] if kind == "APPROACH" else [])
-        win = self.map.window(extra)
+        nav = self.refresh_nav(unknown_ok, force=True)
+        cost, win = nav["cost"], nav["win"]
         i0, i1, j0, j1 = win
-        X = self.map.cx[i0:i1][:, None]
-        Y = self.map.cy[j0:j1][None, :]
+        X, Y = self.map.cx[i0:i1, None], self.map.cy[None, j0:j1]
         six, siy = self.map.cell(rx, ry)
         start = (six - i0, siy - j0)
-
-        found = []
-        pmask = self.people_mask(X, Y)
-        for use_people in ((True, False) if pmask is not None else (False,)):   # avoid people's paths if at all possible
-            for lvl in LEVELS:                                  # widest clearance first
-                trav, fr = self.map.derive(win, rx, ry, lvl, unknown_ok)
-                if use_people:
-                    trav = trav & ~pmask
-                    fr = fr & ~pmask
-                goal = self.goal_mask(kind, trav, fr, X, Y, win)
-                lg = None
-                if kind == "EXPLORE":                           # finish this room first: nearby unseen spots count too
-                    lg = self.goal_mask("LOOK", trav, fr, X, Y, win) & (np.hypot(X - rx, Y - ry) < 6.0)
-                    goal = goal | lg
-                if not goal.any():
-                    continue
-                path = Mapper.bfs(trav, start, goal)
-                if path:
-                    self.goal_is_look = bool(lg is not None and lg[path[-1][0], path[-1][1]] and not fr[path[-1][0], path[-1][1]])
-                    found.append((path, trav, fr, goal))
-                    if len(found) == 2:
-                        break
-            if found:
-                break
-        if not found:
-            self.dlog("plan(%s) found no route (window %s)" % (kind, win))
+        path, info = None, None
+        # A passing person never enters this static goal-selection decision.
+        if kind in ("EXPLORE", "LOOK") and self.goal_kind == kind and self.goal_xy is not None:
+            gi, gj = self.map.cell(*self.goal_xy)
+            cell = (gi - i0, gj - j0)
+            if 0 <= cell[0] < cost.shape[0] and 0 <= cell[1] < cost.shape[1] \
+                    and not self.map.blk[gi, gj] and np.isfinite(cost[cell]):
+                gain = self.map.information_gain(cell, nav, floor_only=(kind == "LOOK" or bool(
+                    self.goal_info and self.goal_info.get("floor_only"))))
+                if t - self.goal_pick_t < GOAL_HOLD or gain > RES ** 2:
+                    path, _ = Mapper.astar(cost, start, [cell])
+                    info = self.goal_info
+        if path is None:
+            if kind in ("EXPLORE", "LOOK"):
+                path, info = self.select_exploration_goal(kind, nav, start, X, Y)
+            else:
+                goals = self.goal_mask(kind, np.isfinite(cost), nav["frontier"], X, Y, win)
+                path, _ = Mapper.astar(cost, start, np.argwhere(goals))
+        if path is None:
+            self.dlog("A*(%s): no safe route; collision boundary remains fixed" % kind)
             return False
-        path, trav, fr, gmask = found[0]
-        if len(found) == 2 and len(path) * 1.0 > 1.35 * len(found[1][0]) + 20:   # wide route is a big detour
-            path, trav, fr, gmask = found[1]
-
-        dgoal = math.hypot(self.goal_xy[0] - rx, self.goal_xy[1] - ry) if self.goal_xy is not None else 0.0
-        if kind == "EXPLORE" and self.goal_xy is not None and (dgoal > 1.0 or (t - self.goal_pick_t < 8.0 and dgoal > 0.35)):
-            gx, gy = self.goal_xy                               # hysteresis: keep the old goal if it is still ahead of us and reasonable
-            dg = np.hypot(X - gx, Y - gy)
-            g2 = (fr | gmask) & (dg < (1.0 if dgoal > 1.0 else 0.5))
-            if g2.any():                                        # commit to the cell of the old goal, not to whatever frontier is nearest to us
-                ki = int(np.argmin(np.where(g2, dg, 1e9)))
-                g2 = np.zeros_like(g2)
-                g2.flat[ki] = True
-                p2 = Mapper.bfs(trav, start, g2)
-                if p2 and len(p2) <= 2.0 * len(path) + 50:
-                    path = p2
-
-        cells = smooth_cells(path, trav)
+        cells = smooth_cells(path, np.isfinite(cost))
         pts = [self.map.center(i + i0, j + j0) for i, j in cells[1:]]
-        if kind == "RETURN" and math.hypot(pts[-1][0], pts[-1][1]) > 0.05:
-            pts.append((0.0, 0.0))
-        self.path = densify((rx, ry), pts)
+        if not pts:
+            pts = [self.map.center(path[-1][0] + i0, path[-1][1] + j0)]
         newg = pts[-1]
-        if kind == "EXPLORE" and (self.goal_xy is None or math.hypot(newg[0] - self.goal_xy[0], newg[1] - self.goal_xy[1]) > 0.5):
-            self.goal_pick_t = t                                # a new goal was chosen: stick with it for a few seconds
-        if kind == "EXPLORE" and (self.goal_xy is None or math.hypot(newg[0] - self.goal_xy[0], newg[1] - self.goal_xy[1]) > 1.0):
-            self.goal_t0 = t                                    # a new goal: restart its chase timer
-        self.goal_xy = newg
-        self.dlog("plan(%s) ok: %d waypoints, goal (%.1f, %.1f), look-goal %s" % (kind, len(self.path), newg[0], newg[1], self.goal_is_look))
+        changed = self.goal_kind != kind or self.goal_xy is None or math.hypot(
+            newg[0] - self.goal_xy[0], newg[1] - self.goal_xy[1]) > RES * 0.5
+        if changed:
+            self.goal_pick_t = self.goal_t0 = t
+            if info is not None:
+                self.log("goal %s (%.1f, %.1f): gain=%.2fm2 cost=%.2f revisit=%.2f risk=%.2f score=%.2f"
+                         % (kind, *newg, info["gain"], info["path_cost"], info["revisit"],
+                            info["risk"], info["score"]))
+        self.goal_xy, self.goal_kind, self.goal_info = newg, kind, info
+        self.goal_is_look = kind == "LOOK"
+        self.path = densify((rx, ry), pts)
+        self.plan_unknown = unknown_ok
+        self.path_obstructed_since = None
+        self.dlog("A*(%s): %d waypoints to (%.1f, %.1f)" % (kind, len(self.path), *newg))
         if kind == "LOOK":
             self.look_goal = newg
-        self.arrived = False
-        self.tight_fail = 0
+        self.arrived, self.tight_fail = False, 0
         return True
 
     def use_crumbs(self):
@@ -1690,14 +2030,53 @@ class Agent:
         self.last_plan = self.t
 
     def path_blocked(self):
-        L = self.map.L
-        for x, y in self.path[:25]:
-            ix, iy = self.map.cell(x, y)
-            if not self.map.inside(ix, iy):
-                return True
-            if (L[ix - 3:ix + 4, iy - 3:iy + 4] > 1.0).any():
-                return True
-        return False
+        """Validate every segment against the same hard boundary used by A*."""
+        if not self.path:
+            return False
+        nav = self.refresh_nav()
+        i0, _, j0, _ = nav["win"]
+        cells = [(i - i0, j - j0) for i, j in
+                 (self.map.cell(*p) for p in [(self.x, self.y)] + self.path)]
+        trav = np.isfinite(nav["cost"])
+        return any(not line_free(trav, a, b) for a, b in zip(cells, cells[1:]))
+
+    def route_needs_plan(self):
+        """No periodic goal changes: replan on arrival, deviation or persistent obstruction."""
+        if not self.path:
+            return True
+        if self.path_blocked():
+            if self.path_obstructed_since is None:
+                self.path_obstructed_since = self.t
+            return self.t - self.path_obstructed_since >= PATH_BLOCK_CONFIRM
+        self.path_obstructed_since = None
+        # Distance to segments, not just waypoints (a long straight segment is valid).
+        points = np.asarray(self.path)
+        if len(points) < 2:
+            return False
+        a, b = points[:-1], points[1:]
+        d = b - a
+        u = np.clip(np.sum((np.array([self.x, self.y]) - a) * d, axis=1)
+                    / np.maximum(np.sum(d * d, axis=1), 1e-12), 0, 1)
+        distance = np.linalg.norm(a + u[:, None] * d - [self.x, self.y], axis=1).min()
+        return distance > max(0.6, 3 * RES)
+
+    def trajectory_cost(self, nav, xs, ys):
+        """Reject rollout segments crossing hard/unknown cells, including diagonal corners."""
+        i0, _, j0, _ = nav["win"]
+        c, s = math.cos(self.yaw), math.sin(self.yaw)
+        wx, wy = self.x + c * xs - s * ys, self.y + s * xs + c * ys
+        ii = np.floor((wx - GX0) / RES).astype(int) - i0
+        jj = np.floor((wy - GY0) / RES).astype(int) - j0
+        root = self.map.cell(self.x, self.y)
+        start = (root[0] - i0, root[1] - j0)
+        cost, values = nav["cost"], np.full(xs.shape[0], np.inf)
+        for k in range(xs.shape[0]):
+            pts = [start] + list(zip(ii[k], jj[k]))
+            cells = [p for a, b in zip(pts, pts[1:]) for p in grid_segment(a, b)]
+            if all(0 <= i < cost.shape[0] and 0 <= j < cost.shape[1] and math.isfinite(cost[i, j])
+                   for i, j in cells):
+                values[k] = float(np.mean([cost[p] - 1.0 for p in cells]))
+        return values
 
     def plan_return(self, t):
         """Way home with a fallback chain: map path -> path through unknown -> breadcrumbs -> direct."""
@@ -1765,46 +2144,55 @@ class Agent:
         else:
             d_now, gap = 5.0, 9.0
         self.clear_now = d_now
-        mt = self.moving_tracks()
-        near_dyn = any(self.dist((tr["x"], tr["y"])) < 2.5 for tr in mt)
+        mt = self.pedestrian_tracks()
+        near_dyn = bool(mt)
+        person_now = self.nearest_person_gap(mt)
         if near_dyn:
-            vmax = min(vmax, 0.8)
-        elif any(self.dist((tr["x"], tr["y"])) < 5.0 for tr in mt):
-            vmax = min(vmax, 0.95)                                  # somebody is walking around: no full speed
+            if person_now <= PERSON_STOP:
+                vmax = 0.0                                         # let the person pass; do not squeeze by
+            elif person_now < PERSON_CAUTION:
+                scale = (person_now - PERSON_STOP) / (PERSON_CAUTION - PERSON_STOP)
+                vmax = min(vmax, V_MAX * clip(0.25 + 0.75 * scale, 0.25, 1.0))
         bearing = abs(math.atan2(ty, tx))
         vmax = min(vmax, max(0.25, V_MAX * (1.6 - bearing)))        # turn first, then speed up
         vmax = min(vmax, math.sqrt(2 * 1.5 * max(gap - 0.15, 0.0)))     # always able to stop before what we see
 
         if d_now < MARGIN:
-            vmax = min(vmax, 0.5, 0.42 * V_MAX)                     # tight spot: slow and careful
-        elif d_now < MARGIN + 0.12:
-            vmax = min(vmax, 0.65 * V_MAX)                          # narrow gap: no full speed (a jam at speed can fling the robot)
+            vmax = min(vmax, 0.35 * V_MAX)
+        nav = self.refresh_nav()
+        ci, cj = self.map.cell(self.x, self.y)
+        ci, cj = ci - nav["win"][0], cj - nav["win"][2]
+        if 0 <= ci < nav["risk"].shape[0] and 0 <= cj < nav["risk"].shape[1]:
+            vmax = min(vmax, V_MAX * max(0.25, 1.0 - 0.75 * float(nav["risk"][ci, cj])))
         back_ok = self.rear_cover and (d_now < 0.30 or near_dyn)                          # squeezed, or a person is close: may reverse
-        v_lo = max(-0.3 if back_ok else 0.0, self.v - A_BRAKE * DW)
+        v_lo = max(-min(0.3, 0.5 * V_MAX) if back_ok else 0.0, self.v - A_BRAKE * DW)
         v_hi = max(v_lo, min(vmax, self.v + A_V * DW))
         vs = np.linspace(v_lo, v_hi, 7)
         ws = np.linspace(max(-W_MAX, self.w - A_W * DW), min(W_MAX, self.w + A_W * DW), 13)
         VV, WW = (a.ravel() for a in np.meshgrid(vs, ws, indexing="ij"))
         xs, ys, th, dmin = self.rollout(VV, WW, P)
+        pmin = np.full(len(VV), 9.0)
         if mt:                                                      # where will the people be during each rollout?
             xp, yp, thp, _ = self.rollout(VV, WW, np.zeros((0, 2), np.float32), PEOPLE_STEPS)   # longer look-ahead for people
             taus = SIM_DT * np.arange(1, PEOPLE_STEPS + 1)
             cc, ss = np.cos(thp), np.sin(thp)
             for tr in mt:
-                pxw, pyw = tr["x"] + tr["v"][0] * taus - self.x, tr["y"] + tr["v"][1] * taus - self.y
+                pxw, pyw = tr["x"] + tr["vx"] * taus - self.x, tr["y"] + tr["vy"] * taus - self.y
                 pr, qr = c0 * pxw + s0 * pyw, -s0 * pxw + c0 * pyw
                 dx, dy = pr[None, :] - xp, qr[None, :] - yp
                 xr, yr = dx * cc + dy * ss, -dx * ss + dy * cc
-                dd = np.hypot(np.maximum(np.abs(xr) - HL, 0.0), np.maximum(np.abs(yr) - HW, 0.0)) - 0.30 - 0.06 * taus[None, :]
-                dmin = np.minimum(dmin, dd.min(axis=1))
+                uncertainty = tr["uncertain"] + 0.06 * taus[None, :]
+                dd = np.hypot(np.maximum(np.abs(xr) - HL, 0.0), np.maximum(np.abs(yr) - HW, 0.0)) \
+                     - PERSON_RADIUS - uncertainty
+                pmin = np.minimum(pmin, dd.min(axis=1))
         req = MARGIN + 0.08 * np.maximum(VV, 0.0)                   # more room needed at higher speed
         ok = dmin >= np.minimum(req, 0.8 * d_now)
         if d_now < MARGIN:
             ok = dmin >= 0.6 * d_now                                # squeezed: creep on, but do not push into the wall
+        ok &= pmin >= PERSON_MARGIN                                # people have a larger, non-relaxing safety margin
+        route_cost = self.trajectory_cost(nav, xs, ys)
+        ok &= np.isfinite(route_cost)
         if not ok.any():
-            if near_dyn:                                            # someone is coming: at least maximise the distance
-                k = int(np.argmax(dmin))
-                return float(VV[k]), float(WW[k])
             return None
 
         xf, yf, tf = xs[:, -1], ys[:, -1], th[:, -1]
@@ -1821,6 +2209,8 @@ class Agent:
             dpath = np.zeros(len(VV))
         score = (2.0 * progress + 1.2 * (1.0 - head) + 2.0 * np.minimum(dmin, 0.45) / 0.45
                  + 0.8 * VV / V_MAX - 0.2 * np.abs(WW - self.w) / W_MAX - 0.9 * np.minimum(dpath, 1.5))
+        score += 2.5 * np.minimum(pmin, 0.6) / 0.6                  # among safe choices, stay farther from people
+        score -= 0.35 * route_cost
         score[~ok] = -1e9
         k = int(np.argmax(score))
         return float(VV[k]), float(WW[k])
@@ -1844,9 +2234,19 @@ class Agent:
         return float(VV[k]), float(WW[k])
 
     def follow(self, vcap=V_MAX):
+        nav = self.refresh_nav()
+        i0, _, j0, _ = nav["win"]
+        trav = np.isfinite(nav["cost"])
+        ri, rj = self.map.cell(self.x, self.y)
+
+        def visible(p):
+            i, j = self.map.cell(*p)
+            return line_free(trav, (ri - i0, rj - j0), (i - i0, j - j0))
+
         if len(self.path) > 1:                                      # waypoints we have already passed are dropped
             n = min(len(self.path), 20)
-            k = min(range(n), key=lambda i: self.dist(self.path[i]))
+            available = [i for i in range(n) if visible(self.path[i])]
+            k = min(available, key=lambda i: self.dist(self.path[i])) if available else 0
             if k > 0:
                 del self.path[:k]
         last_r = WP_TOL_HOME if self.state == "RETURN" else WP_TOL_LAST
@@ -1858,10 +2258,12 @@ class Agent:
             self.brake()
             return
         look = LOOKAHEAD + 1.3 * max(self.v, 0.0)
-        tgt = self.path[-1]
+        tgt = self.path[0]
         for p in self.path:
+            if not visible(p):
+                break
+            tgt = p
             if self.dist(p) >= look:
-                tgt = p
                 break
         vmax = min(vcap, 0.25 + 0.7 * self.dist(self.path[-1]))     # slow down when arriving
         res = self.dwa(tgt, vmax)
@@ -1885,7 +2287,7 @@ class Agent:
             self.hist.popleft()
         t = self.t
         # somebody walking close by: waiting for them to pass is not "stuck"
-        wait = 10.0 if any(self.dist((tr["x"], tr["y"])) < 3.0 for tr in self.moving_tracks()) else 3.0
+        wait = 10.0 if any(self.dist((tr["x"], tr["y"])) < 3.0 for tr in self.pedestrian_tracks()) else 3.0
         if self.blocked_since and t - self.blocked_since > wait:
             return True
         if self.path and abs(self.v) < 0.05 and abs(self.w) < 0.15:  # wants to go somewhere but is not moving
@@ -1941,7 +2343,7 @@ class Agent:
         self.hist.clear()
         self.relocalize(1.6, "after a jam")
         self.blocked_since = self.idle_since = None
-        if self.state == "EXPLORE" and self.goal_xy:
+        if self.state == "EXPLORE" and self.goal_xy and (repeated or not self.movers()):
             self.map.blacklist(*self.goal_xy)
         if self.state == "LOOK" and self.look_goal:
             self.vp_done.append(self.look_goal)
@@ -1950,6 +2352,9 @@ class Agent:
             if self.state == "RETURN":
                 self.ret_mode = min(self.ret_mode + 1, 3)
                 self.log("repeatedly stuck on the way home -> fallback level %d" % self.ret_mode)
+        if self.state == "APPROACH" and self.cand and self.dist(self.cand["p"]) < 0.8:
+            self.reach_target(self.cand, "stuck right next to it")   # 0.8 m or less from the apple and nothing lets us closer: that counts
+            return
         if self.state == "APPROACH" and self.cand and n_here >= 2:
             self.skip_target(self.cand)                              # this target keeps getting us stuck: try later
             self.log("target unreachable right now -> will retry later")
@@ -1957,8 +2362,37 @@ class Agent:
 
     def replan_soon(self, state=None):
         if state:
+            if state != self.state:
+                self.goal_xy, self.goal_kind, self.goal_info = None, None, None
             self.state = state
         self.path, self.last_plan, self.arrived = [], -99.0, False
+        self.path_obstructed_since = None
+
+    def restart_search(self, t):
+        """All frontiers and unseen corners are used up but fewer targets than expected were found: forget what was 'seen' and
+        'given up on' and search the whole map again (a target hides where the camera did not really look)."""
+        if EXPECTED_TARGETS is None or self.n_reached() >= EXPECTED_TARGETS:
+            return False
+        if self.search_pass >= MAX_SEARCH_PASSES or t > self.explore_max - 90.0 or self.budget_left() < 150.0:
+            return False
+        self.search_pass += 1
+        self.log("only %d of %d targets found and nothing left to explore -> searching the whole map again (pass %d)"
+                 % (self.n_reached(), EXPECTED_TARGETS, self.search_pass))
+        self.map.blk[:] = False
+        self.map.blk_log = []
+        self.map.cov[:] = False
+        self.map.vpvis[:] = False
+        self.vp_done, self.vp_real, self.vp_swept = [], set(), []
+        for g in self.targets:
+            if g["status"] == "skipped":
+                g["status"], g["skips"] = "pending", 0
+        self.retry_done, self.fine_look, self.look_first = False, False, None
+        self.last_sweep_t = -99.0
+        self.goal_xy = None
+        self.area_anchor, self.area_mask, self.area_win = None, None, None
+        self.frontier_observations = []
+        self.replan_soon("EXPLORE")
+        return True
 
     def go_home(self, why):
         self.log("returning to start (%s)" % why)
@@ -1966,6 +2400,7 @@ class Agent:
             np.savez("map_dump.npz", L=self.map.L, cov=self.map.cov, vp=np.array(self.vp_done).reshape(-1, 2), trail=np.array(self.trail).reshape(-1, 2) if len(self.trail) else np.zeros((0, 2)))
         self.ret_mode, self.ret_best, self.ret_prog_t = 0, 1e9, self.t
         self.cand = None
+        self.area_anchor, self.area_mask, self.area_win = None, None, None
         self.replan_soon("RETURN")
 
     def cand_reached(self, tg):
@@ -2037,23 +2472,122 @@ class Agent:
 
     def start_sweep(self):
         """Stand still and turn 360 degrees so the camera sees everything around this spot."""
-        self.vp_done.append((self.x, self.y))
+        self.goal_xy, self.goal_kind, self.goal_info = None, None, None
+        self.path = []
         self.last_sweep_t = self.t
         P = self.scan_points(2.0)
         if (len(P) and float(np.hypot(P[:, 0], P[:, 1]).min()) < math.hypot(HL, HW) + 0.04) or \
-                any(self.dist((tr["x"], tr["y"])) < 2.0 for tr in self.moving_tracks()):
+                any(self.dist((tr["x"], tr["y"])) < 2.0 for tr in self.pedestrian_tracks()):
             self.log("no room / people close -> skipping the 360-degree look here")
             self.replan_soon("EXPLORE")
             return
-        self.vp_swept.append((self.x, self.y))
-        if self.los_looks:                                          # short-sighted camera: what a look could not see through walls stays open
-            self.vp_real.add(self.vp_done[-1])
-            self.map.mark_vp(self.x, self.y, SWEEP_GAP)
-        elif self.fine_look:                                        # far-seeing camera, corner pass: same rule from now on
-            self.vp_real.add(self.vp_done[-1])
-            self.map.mark_vp(self.x, self.y, SWEEP_GAP)
         self.state, self.sweep_turned, self.sweep_prev, self.sweep_until = "SWEEP", 0.0, self.yaw, self.t + 10.0
         self.log("360-degree look at (%.1f, %.1f)" % (self.x, self.y))
+
+    def complete_sweep(self):
+        """Record coverage only after a full rotation, not when a look is skipped/interrupted."""
+        p = (self.x, self.y)
+        self.vp_done.append(p)
+        self.vp_swept.append(p)
+        if self.los_looks:                                          # short-sighted camera: what a look could not see through walls stays open
+            self.vp_real.add(p)
+            self.map.mark_vp(self.x, self.y, SWEEP_GAP)
+        elif self.fine_look:                                        # far-seeing camera, corner pass: same rule from now on
+            self.vp_real.add(p)
+            self.map.mark_vp(self.x, self.y, SWEEP_GAP)
+        nav = self.refresh_nav(unknown_ok=False, force=True)
+        i, j = self.map.cell(*p)
+        cell = (i - nav["win"][0], j - nav["win"][2])
+        self.frontier_observations = [v for v in self.frontier_observations
+                                      if math.dist(p, v["p"]) >= AREA_OBSERVE_RADIUS]
+        self.frontier_observations.append(dict(p=p, gain=self.map.information_gain(cell, nav),
+                                              floor_gain=self.map.information_gain(cell, nav, floor_only=True)))
+
+    # ------------------------------------------------------------ YOLO picture with bounding boxes on a Display
+    def setup_yolo_display(self, r):
+        self.ydisp = None
+        if not YOLO_DISPLAY or getattr(self, "yolo", None) is None:
+            return
+        try:
+            names = [r.getDeviceByIndex(i).getName() for i in range(r.getNumberOfDevices())]
+        except Exception:
+            names = []
+        if YOLO_DISPLAY not in names:
+            print("YOLO display: no Display named '%s' in the world (add Display { name \"%s\" width 320 height 240 } to the robot) -> no boxes shown" % (YOLO_DISPLAY, YOLO_DISPLAY))
+            return
+        self.ydisp = r.getDevice(YOLO_DISPLAY)
+        print("YOLO display '%s': camera picture with all detected objects, labels and confidence" % YOLO_DISPLAY)
+
+    def target_colour_name(self, rgbf, x1, y1, x2, y2):
+        """Name of the wanted colour that this box has ('red' ...), or None when it is not a target colour."""
+        cx, cy, hw, hh = 0.5 * (x1 + x2), 0.5 * (y1 + y2), 0.35 * (x2 - x1), 0.35 * (y2 - y1)
+        patch = rgbf[int(max(cy - hh, 0)):int(min(cy + hh + 1, self.ch)), int(max(cx - hw, 0)):int(min(cx + hw + 1, self.cw))]
+        if patch.size == 0:
+            return None
+        names = TARGET_COLOR if isinstance(TARGET_COLOR, (tuple, list)) else []
+        for n in names:
+            rgb = COLOR_TABLE.get(str(n).lower()) if isinstance(n, str) else tuple(n)
+            if rgb is not None and float(self.color_close(patch, YOLO_COLOR_TOL, rgb).mean()) >= YOLO_COLOR_MIN:
+                return str(n) if isinstance(n, str) else "target"
+        if not names and float(self.colour_match(patch, YOLO_COLOR_TOL).mean()) >= YOLO_COLOR_MIN:
+            return "target"
+        return None
+
+    def draw_yolo_frame(self, result, bgr, rgbf):
+        """Camera picture with all boxes.  A sports ball / apple / orange box in the wanted colour is drawn green and labelled
+        '<colour> apple' (YOLO itself often calls a small apple 'sports ball'); every other object keeps YOLO's own name."""
+        import cv2
+        frame = np.ascontiguousarray(bgr).copy()
+        self._had_tgt = False
+        names = result.names
+        for b in result.boxes:
+            cls, conf = int(b.cls[0]), float(b.conf[0])
+            x1, y1, x2, y2 = [int(round(float(v))) for v in b.xyxy[0]]
+            nm = names[cls] if not isinstance(names, dict) else names.get(cls, str(cls))
+            col, label = (255, 160, 0), nm
+            if not YOLO_CLASSES or cls in YOLO_CLASSES:
+                cn = self.target_colour_name(rgbf, x1, y1, x2, y2)
+                if cn:
+                    col, label = (0, 220, 0), "%s apple" % cn
+                    self._had_tgt = True
+            cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
+            txt = "%s %.2f" % (label, conf)
+            (tw, th), base = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            ty = y1 - 4 if y1 - th - 6 > 0 else y2 + th + 4
+            cv2.rectangle(frame, (x1, ty - th - 3), (x1 + tw + 2, ty + base - 1), col, -1)
+            cv2.putText(frame, txt, (x1 + 1, ty - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+        return frame
+
+    def update_yolo_display(self, result, bgr=None, rgbf=None):
+        """Camera frame with every YOLO box (any class), fitted into the Display."""
+        if self.ydisp is None:
+            return
+        try:
+            from controller import Display
+            import cv2
+            if bgr is not None and rgbf is not None:
+                frame = self.draw_yolo_frame(result, bgr, rgbf)                       # BGR
+            else:
+                frame = result.plot(labels=True, conf=True, boxes=True, line_width=2)
+            dw, dh = self.ydisp.getWidth(), self.ydisp.getHeight()
+            fh, fw = frame.shape[:2]
+            sc = min(dw / fw, dh / fh)
+            w2, h2 = max(1, round(fw * sc)), max(1, round(fh * sc))
+            small = cv2.resize(frame, (w2, h2), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR)
+            canvas = np.zeros((dh, dw, 3), np.uint8)
+            left, top = (dw - w2) // 2, (dh - h2) // 2
+            canvas[top:top + h2, left:left + w2] = small
+            rgb = np.ascontiguousarray(canvas[..., ::-1])
+            ref = self.ydisp.imageNew(rgb.tobytes(), Display.RGB, dw, dh)
+            try:
+                self.ydisp.imagePaste(ref, 0, 0, False)
+            finally:
+                self.ydisp.imageDelete(ref)
+            if YOLO_SAVE:
+                self.ydisp.imageSave(None, YOLO_SAVE.replace(".png", "_target.png") if getattr(self, "_had_tgt", False) else YOLO_SAVE)
+        except Exception as e:
+            print("YOLO display off (%r)" % (e,))
+            self.ydisp = None
 
     # ------------------------------------------------------------ live map on a Display + optional WASD
     def setup_map_display(self, r):
@@ -2077,60 +2611,110 @@ class Agent:
                 self.kb = None
 
     def update_map_display(self):
-        """Robot-centred picture (north up = start-frame +x right, +y up), auto-zoomed to everything known:
-        free floor dark grey, walls light grey, trail blue, planned path yellow, current scan orange, people pink,
-        apples on the floor orange, targets red (white when reached), start purple, robot green with its heading line."""
+        """Show the actual planning layers, selected goal, global path and local prediction."""
+        import cv2
         from controller import Display
         W, H = self.mdisp_wh
-        M = self.map
-        x, y, c, s = self.x, self.y, math.cos(self.yaw), math.sin(self.yaw)
-        img = np.empty((H, W, 4), np.uint8)
-        img[:] = (0x11, 0x18, 0x27, 255)
-        ii, jj = np.nonzero(M.L > 1.0)
-        ox, oy = M.cx[ii], M.cy[jj]
-        fi, fj = np.nonzero(M.L < -0.25)
-        fx, fy = M.cx[fi], M.cy[fj]
-        tr = np.array(self.trail + [(x, y)], float).reshape(-1, 2)
-        P = self.scan_points(6.0)
-        sx, sy = x + c * P[:, 0] - s * P[:, 1], y + s * P[:, 0] + c * P[:, 1]
-        half_w, half_h = max(1.0, (W - 1) / 2 - 16), max(1.0, (H - 1) / 2 - 16)
+        nav = self.refresh_nav()
+        i0, i1, j0, j1 = nav["win"]
+        x, y = self.x, self.y
+        footer = min(86, H // 3)
+        mh = H - footer
+        centre = ((W - 1) / 2, (mh - 1) / 2)
+        trail = np.array(self.trail + [(x, y)], float).reshape(-1, 2)
+        route = np.array([(x, y)] + self.path, float).reshape(-1, 2)
+        known = nav["free"] | nav["occupied"]
+        ii, jj = np.nonzero(known)
+        wx, wy = self.map.cx[ii + i0], self.map.cy[jj + j0]
         sc = 0.02
-        for ax, ay in ((ox, oy), (tr[:, 0], tr[:, 1]), (sx, sy)):
+        for ax, ay in ((wx, wy), (trail[:, 0], trail[:, 1]), (route[:, 0], route[:, 1])):
             if len(ax):
-                sc = max(sc, float(np.abs(ax - x).max()) / half_w, float(np.abs(ay - y).max()) / half_h)
-        k = max(1, int(round(RES / sc)))
+                sc = max(sc, float(np.abs(ax - x).max()) / max(1, centre[0] - 12),
+                         float(np.abs(ay - y).max()) / max(1, centre[1] - 12))
+        img = np.zeros((H, W, 4), np.uint8)
+        img[..., 3] = 255
+        size = max(1, int(round(RES / sc)))
 
-        def put(px_, py_, rgb, size=1):
-            if len(px_) == 0:
+        def pixels(points):
+            p = np.asarray(points, float).reshape(-1, 2)
+            return np.rint(np.column_stack((centre[0] + (p[:, 0] - x) / sc,
+                                            centre[1] - (p[:, 1] - y) / sc))).astype(np.int32)
+
+        def layer(mask, colour):
+            ii, jj = np.nonzero(mask)
+            if not len(ii):
                 return
-            u = np.rint((W - 1) / 2 + (np.asarray(px_, float) - x) / sc).astype(np.int64)
-            v = np.rint((H - 1) / 2 - (np.asarray(py_, float) - y) / sc).astype(np.int64)
-            col = np.array([(rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255, 255], np.uint8)
-            lo, hi = -(size // 2), size - size // 2
-            for dv in range(lo, hi):
-                for du in range(lo, hi):
-                    uu, vv = u + du, v + dv
-                    ok = (uu >= 0) & (uu < W) & (vv >= 0) & (vv < H)
-                    img[vv[ok], uu[ok]] = col
+            uv = pixels(np.column_stack((self.map.cx[ii + i0], self.map.cy[jj + j0])))
+            for du in range(-(size // 2), size - size // 2):
+                for dv in range(-(size // 2), size - size // 2):
+                    u, v = uv[:, 0] + du, uv[:, 1] + dv
+                    ok = (u >= 0) & (u < W) & (v >= 0) & (v < mh)
+                    img[v[ok], u[ok]] = colour
 
-        put(fx, fy, 0x1F2937, k)
-        put(ox, oy, 0xE5E7EB, k)
-        put(tr[:, 0], tr[:, 1], 0x38BDF8)
-        if self.path:
-            pp = np.array(self.path[:80], float).reshape(-1, 2)
-            put(pp[:, 0], pp[:, 1], 0xFACC15)
-        put(sx, sy, 0xF59E0B)
-        if self.tracks:
-            put([tr_["x"] for tr_ in self.tracks], [tr_["y"] for tr_ in self.tracks], 0xF472B6, 3)
-        if self.objs:
-            put([o["p"][0] for o in self.objs], [o["p"][1] for o in self.objs], 0xFB923C, 3)
-        put([0.0], [0.0], 0xA855F7, 5)
-        for g in self.targets:
-            put([g["p"][0]], [g["p"][1]], 0xFFFFFF if g["status"] == "reached" else 0xEF4444, 7)
-            put([g["p"][0]], [g["p"][1]], 0xEF4444, 3)
-        hs = np.linspace(0.0, 0.4, 12)
-        put(x + hs * c, y + hs * s, 0x22C55E)
-        put([x], [y], 0x22C55E, 5)
+        def line(points, colour, width):
+            if len(points) > 1:
+                uv = pixels(points).reshape(-1, 1, 2)
+                cv2.polylines(img, [uv], False, (8, 12, 18, 255), width + 2, cv2.LINE_AA)
+                cv2.polylines(img, [uv], False, colour, width, cv2.LINE_AA)
+
+        wall, hard = (240, 244, 250, 255), (215, 45, 65, 255)
+        cyan, green = (34, 211, 238, 255), (74, 222, 128, 255)
+        yellow, orange, blue = (250, 220, 45, 255), (255, 150, 30, 255), (70, 135, 255, 255)
+        layer(nav["free"], (58, 64, 74, 255))
+        for lo, hi, col in ((0.0, 0.2, (77, 45, 62, 255)), (0.2, 0.5, (119, 49, 81, 255)),
+                            (0.5, 1.01, (173, 64, 105, 255))):
+            layer(nav["free"] & ~nav["hard"] & (nav["risk"] > lo) & (nav["risk"] <= hi), col)
+        layer(nav["hard"] & nav["free"], hard)
+        layer(nav["occupied"], wall)
+        area_colour = (175, 235, 190, 255)
+        if self.area_mask is not None and self.area_win is not None:
+            # Use the saved planning window: the display window can grow between replans.
+            contours, _ = cv2.findContours(self.area_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            ai0, _, aj0, _ = self.area_win
+            for contour in contours:
+                cells = contour.reshape(-1, 2)
+                xy = np.column_stack((self.map.cx[cells[:, 1] + ai0], self.map.cy[cells[:, 0] + aj0]))
+                cv2.polylines(img, [pixels(xy).reshape(-1, 1, 2)], True, area_colour, 1, cv2.LINE_AA)
+        frontiers = np.zeros_like(nav["frontier"])
+        for region in self.map.regions(nav["frontier"], minimum=AREA_FRONTIER_MIN):
+            frontiers[region[:, 0], region[:, 1]] = True
+        layer(frontiers, cyan)
+        line(trail, blue, 2)
+        line(route, yellow, 2)
+        if self.goal_xy is not None:
+            g = tuple(pixels([self.goal_xy])[0])
+            cv2.circle(img, g, 6, green, 2, cv2.LINE_AA)
+            cv2.putText(img, "G", (g[0] + 7, g[1] - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, green, 1)
+        for target in self.targets:
+            p = tuple(pixels([target["p"]])[0])
+            cv2.circle(img, p, 4, wall if target["status"] == "reached" else hard, -1)
+        for person in self.pedestrian_tracks():
+            cv2.circle(img, tuple(pixels([(person["x"], person["y"])])[0]), 4, (255, 80, 200, 255), 1)
+        line(self.local_trajectory, orange, 3)
+        cv2.circle(img, tuple(pixels([(0, 0)])[0]), 3, (167, 100, 245, 255), -1)
+        robot = tuple(pixels([(x, y)])[0])
+        heading = (int(robot[0] + 10 * math.cos(self.yaw)), int(robot[1] - 10 * math.sin(self.yaw)))
+        cv2.circle(img, robot, 3, wall, -1)
+        cv2.arrowedLine(img, robot, heading, wall, 2, tipLength=0.4)
+        img[mh:, :, :3] = (13, 18, 28)
+        legend = (("WALL", wall), ("COLLISION", hard), ("INFLATION", (220, 85, 140, 255)),
+                  ("FREE", (150, 155, 165, 255)), ("UNKNOWN", (80, 85, 92, 255)), ("FRONTIER", cyan),
+                  ("GOAL", green), ("A* PATH", yellow), ("DWA", orange), ("PAST", blue), ("AREA", area_colour))
+        for k, (text, colour) in enumerate(legend):
+            u, v = 5 + (k % 3) * (W // 3), mh + 10 + (k // 3) * 12
+            cv2.line(img, (u, v - 3), (u + 8, v - 3), colour, 2)
+            cv2.putText(img, text, (u + 11, v), cv2.FONT_HERSHEY_SIMPLEX, 0.28, colour, 1, cv2.LINE_AA)
+        if self.goal_info:
+            info = self.goal_info
+            text = "S %.1f  I %.1fm2  C %.1f" % (info["score"], info["gain"], info["path_cost"])
+            text2 = "visit %.2f  risk %.2f  %s" % (info["revisit"], info["risk"], self.goal_kind)
+            if self.area_anchor is not None:
+                text2 = "Area %d  %s  visit %.2f" % (self.area_serial,
+                         "CAMERA" if info.get("floor_only") else self.goal_kind, info["revisit"])
+        else:
+            text, text2 = "Goal: %s" % (self.goal_kind or "selecting"), self.state
+        cv2.putText(img, text, (5, H - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.32, wall, 1, cv2.LINE_AA)
+        cv2.putText(img, text2, (5, H - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.30, wall, 1, cv2.LINE_AA)
         ref = self.mdisp.imageNew(img.tobytes(), Display.RGBA, W, H)
         self.mdisp.imagePaste(ref, 0, 0, False)
         self.mdisp.imageDelete(ref)
@@ -2171,6 +2755,20 @@ class Agent:
         if st == "FINISH":
             self.brake()
             return
+
+        # This guard precedes SWEEP and RECOVER too: no state is allowed to rotate,
+        # reverse or execute an escape manoeuvre into a person who has stepped close.
+        people = self.pedestrian_tracks()
+        person_gap = self.nearest_person_gap(people)
+        if people and person_gap <= PERSON_STOP:
+            if not self.person_hold:
+                self.log("person too close (gap %.2f m) -> emergency stop" % person_gap)
+            self.person_hold = True
+            self.drive(0.0, 0.0)
+            return
+        if self.person_hold:
+            self.log("person clearance restored -> continuing")
+            self.person_hold = False
         if st == "DWELL":
             self.brake()
             if t > self.dwell_until:
@@ -2200,8 +2798,10 @@ class Agent:
                 return
             self.sweep_turned += wrap(self.yaw - self.sweep_prev)
             self.sweep_prev = self.yaw
-            danger = any(self.dist((tr["x"], tr["y"])) < 1.8 for tr in self.moving_tracks())
+            danger = any(self.dist((tr["x"], tr["y"])) < 1.8 for tr in self.pedestrian_tracks())
             if self.sweep_turned >= 6.1 or t > self.sweep_until or danger:
+                if self.sweep_turned >= 6.1:
+                    self.complete_sweep()
                 self.dlog("sweep ends: turned %.2f rad, %s" % (self.sweep_turned,
                           "person close" if danger else ("timeout" if t > self.sweep_until else "done")))
                 self.replan_soon("EXPLORE")
@@ -2217,7 +2817,7 @@ class Agent:
             return
 
         # ---- shoved by a person? the wheels did not move, the robot did: re-anchor on the map when the contact is over
-        if any(self.dist((m[0], m[1])) < 1.3 for m in self.movers()) and self.clear_now < 0.08:
+        if any(self.dist((tr["x"], tr["y"])) < 1.3 for tr in self.pedestrian_tracks()) and self.clear_now < 0.18:
             if self.contact_t is None:
                 self.dlog("person pressed against the robot: map updates paused")
             self.contact_t = self.contact_last = t
@@ -2343,7 +2943,7 @@ class Agent:
             else:
                 self.near_home_t = None
             if hd < START_RADIUS:
-                if ALIGN_AT_START and abs(wrap(self.yaw)) > 0.05 and self.clear_now > 0.2:
+                if ALIGN_AT_START and abs(wrap(self.yaw)) > 0.05 and self.clear_now > (0.2 if abs(HL - HW) > 0.02 else 0.02):   # (a round robot turns on the spot in any gap)
                     self.state, self.align_until = "ALIGN", t + 8.0
                 else:
                     self.finish("back at start")
@@ -2360,25 +2960,26 @@ class Agent:
                     self.ret_best, self.ret_prog_t = 1e9, t
                     self.log("no progress toward start -> fallback level %d" % self.ret_mode)
                     self.replan_soon()
-        elif st == "EXPLORE" and self.goal_xy and t - self.goal_t0 > 45.0:
+        elif st == "EXPLORE" and self.goal_xy and t - self.goal_t0 > 45.0 * max(1.0, 0.48 / V_MAX):
             self.map.blacklist(*self.goal_xy)                       # chasing one frontier too long
             self.replan_soon()
 
-        if st == "EXPLORE" and self.goal_is_look and self.goal_xy and (self.arrived or self.dist(self.goal_xy) < 0.6):
+        if st == "EXPLORE" and self.goal_xy and (self.arrived or self.dist(self.goal_xy) < max(WP_TOL_LAST, 0.15)):
             self.goal_is_look = False
             self.start_sweep()                                  # reached a viewpoint: look around (marks it done)
             return
-        if st == "EXPLORE" and self.step_i % 8 == 0 and self.sweep_wanted():
+        if st == "EXPLORE" and self.goal_xy is None and self.step_i % 8 == 0 and self.sweep_wanted():
             self.start_sweep()
             return
 
         # ---- (re)plan
-        period = 1.3 if self.movers() else 2.5
-        need = (not self.path) or (t - self.last_plan > period and st != "LOOK")
-        if st == "APPROACH" and t < self.nudge_until and self.path:
-            need = False                                        # finishing the last bit: do not replan it away
-        if not need and self.step_i % 16 == 0:
-            need = self.path_blocked()
+        need = self.route_needs_plan()
+        if st == "APPROACH" and self.cand and self.goal_xy and t - self.last_plan > 2.5:
+            # Target localization can improve while approaching; update only if its goal ring moved.
+            need |= math.hypot(self.cand["p"][0] - self.goal_xy[0], self.cand["p"][1] - self.goal_xy[1]) > TARGET_REACH + APPROACH_OUT + 0.15
+        if self.path_obstructed_since is not None and not need:
+            self.brake()                                        # confirm a blockage before replacing a static route
+            return
         if need and not (st == "RETURN" and self.ret_mode >= 2 and self.path and t - self.last_plan < 6.0):
             if st == "RETURN":
                 self.plan_return(t)
@@ -2406,10 +3007,13 @@ class Agent:
                         self.log("nothing left to look at -> second pass")
                         self.retry_done = True
                         self.map.blk[:] = False
+                        self.map.blk_log = []
                         for g in self.targets:
                             if g["status"] == "skipped":
                                 g["status"] = "pending"
                         self.last_plan = t - 1.5
+                    elif self.restart_search(t):
+                        pass
                     else:
                         left = [g for g in self.targets if g["status"] != "reached"]
                         self.go_home("exploration complete, %d target(s) found%s"
@@ -2574,8 +3178,107 @@ class Agent:
                 self.nofling, self.contact_t = True, self.t
             self.log("TEST: robot teleported by (%.1f, %.1f) m" % (dx, dy))
 
+    def setup_gesture_control(self):
+        """Laptop webcam: an open palm stops the robot; a fist resumes it."""
+        self.gesture_cam = self.gesture_hands = None
+        self.gesture_api = None
+        self.gesture_stop, self.gesture_last = False, 0.0
+        self.gesture_seen, self.gesture_count = None, 0
+        if not USE_GESTURE_CONTROL:
+            print("Gesture control: OFF")
+            return
+        try:
+            import cv2
+            import mediapipe as mp
+            self.gesture_cam = cv2.VideoCapture(0)
+            if not self.gesture_cam.isOpened():
+                raise RuntimeError("webcam 0 is unavailable")
+            if hasattr(mp, "solutions"):
+                self.gesture_api = "solutions"
+                self.gesture_hands = mp.solutions.hands.Hands(
+                    max_num_hands=1, min_detection_confidence=0.65,
+                    min_tracking_confidence=0.65)
+            else:
+                import tempfile
+                import urllib.request
+                model = _os.path.join(tempfile.gettempdir(), "hand_landmarker.task")
+                if not _os.path.isfile(model):
+                    print("Gesture control: downloading hand model once...")
+                    urllib.request.urlretrieve(
+                        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+                        "hand_landmarker/float16/1/hand_landmarker.task", model)
+                options = mp.tasks.vision.HandLandmarkerOptions(
+                    base_options=mp.tasks.BaseOptions(model_asset_path=model),
+                    num_hands=1, min_hand_detection_confidence=0.65,
+                    min_hand_presence_confidence=0.65)
+                self.gesture_api = "tasks"
+                self.gesture_hands = mp.tasks.vision.HandLandmarker.create_from_options(options)
+            cv2.namedWindow("Gesture Control", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Gesture Control", 480, 360)
+            cv2.moveWindow("Gesture Control", 30, 80)
+            try:
+                cv2.setWindowProperty("Gesture Control", cv2.WND_PROP_TOPMOST, 1)
+            except Exception:
+                pass
+            print("Gesture control ready: PALM=stop, FIST=resume")
+        except Exception as e:
+            if self.gesture_cam is not None:
+                self.gesture_cam.release()
+            self.gesture_cam = None
+            print("Gesture control disabled (%s)" % e)
+
+    def update_gesture_control(self):
+        """Read at 8 Hz and require four equal readings before changing state."""
+        if self.gesture_cam is None or time.monotonic() - self.gesture_last < 0.125:
+            return
+        self.gesture_last = time.monotonic()
+        import cv2
+        ok, frame = self.gesture_cam.read()
+        if not ok:
+            return
+        frame = cv2.flip(frame, 1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if self.gesture_api == "solutions":
+            result = self.gesture_hands.process(rgb)
+            hands = [h.landmark for h in (result.multi_hand_landmarks or [])]
+        else:
+            import mediapipe as mp
+            result = self.gesture_hands.detect(
+                mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb)))
+            hands = result.hand_landmarks
+        gesture = None
+        if hands:
+            lm = hands[0]
+            h, w = frame.shape[:2]
+            links = ((0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
+                     (5, 9), (9, 10), (10, 11), (11, 12), (9, 13), (13, 14),
+                     (14, 15), (15, 16), (13, 17), (17, 18), (18, 19), (19, 20), (0, 17))
+            pts = [(int(p.x * w), int(p.y * h)) for p in lm]
+            for a, b in links:
+                cv2.line(frame, pts[a], pts[b], (0, 255, 0), 2)
+            for p in pts:
+                cv2.circle(frame, p, 3, (0, 255, 255), -1)
+            dist = lambda a: (lm[a].x - lm[0].x) ** 2 + (lm[a].y - lm[0].y) ** 2
+            extended = sum(dist(tip) > 1.25 * dist(pip)
+                           for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18)))
+            gesture = "PALM" if extended >= 4 else "FIST" if extended == 0 else None
+        if gesture == self.gesture_seen:
+            self.gesture_count += 1
+        else:
+            self.gesture_seen, self.gesture_count = gesture, 1
+        if gesture and self.gesture_count == 4:
+            self.gesture_stop = gesture == "PALM"
+            print("Gesture %s -> robot %s" %
+                  (gesture, "STOPPED" if self.gesture_stop else "RUNNING"))
+        cv2.putText(frame, "%s | %s" % (gesture or "-", "STOP" if self.gesture_stop else "RUN"),
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (0, 0, 255) if self.gesture_stop else (0, 255, 0), 2)
+        cv2.imshow("Gesture Control", frame)
+        cv2.waitKey(1)
+
     def run(self):
         errs = {}
+        self.dlog("detector: %s" % ("YOLO11n" if getattr(self, "yolo", None) is not None else "colour only (no YOLO)"))
         while self.robot.step(self.dt) != -1:
             try:
                 self._step()
@@ -2592,9 +3295,14 @@ class Agent:
 
     def _step(self):
         self.t = self.robot.getTime()
+        self.map.now = self.t
         self.step_i += 1
+        self.update_gesture_control()
+        if self.step_i % 40 == 0:
+            self.map.expire_blk(BLK_TTL)
         self.test_teleport()
         self.odometry()
+        self.map.record_visit(self.x, self.y)
         if math.hypot(self.x - self.crumbs[-1][0], self.y - self.crumbs[-1][1]) > 0.4:
             self.crumbs.append((self.x, self.y))
         if self.step_i % 2 == 0:
@@ -2617,7 +3325,9 @@ class Agent:
             cam_new = self.camera_fresh()
             if self.state in ("EXPLORE", "APPROACH", "LOOK", "SWEEP") and (cam_new if CAM_SYNC else self.step_i % 4 == 0):
                 self.update_camera()
-            if self.kb is None or not self.manual_step():
+            if self.gesture_stop:
+                self.drive(0.0, 0.0)
+            elif self.kb is None or not self.manual_step():
                 self.tick()
         if self.mdisp is not None and self.t - self.mdisp_t >= MAP_PERIOD:
             self.mdisp_t = self.t
