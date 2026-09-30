@@ -89,6 +89,7 @@ GW, GH = 500, 500             # 50 m x 50 m around the start
 LIDAR_USE = 12.0              # [m] max range used for mapping
 COV_RANGE = 7.0               # [m] how far the camera is trusted to spot a target (camera coverage map)
 LOOK_MIN = 500                # [cells] unseen floor (0.01 m2 each) that makes a far spot worth a 360-degree look
+MOVER_MIN_SPEED = 0.20         # [m/s] a tracked thing must move faster than this to count as a walking person (slow-people worlds: lower)
 SWEEP_MIN = 600               # [cells] same, for a quick look on the spot while exploring
 SWEEP_GAP = 5.0               # [m] minimum distance between two 360-degree looks
 SWEEP_W = 1.8                 # [rad/s] turn rate during a 360-degree look
@@ -132,7 +133,7 @@ COLOR_TABLE = {"red": (1.0, 0.0, 0.0), "orange": (1.0, 0.73, 0.0), "purple": (0.
 
 # ======================= TURTLEBOT3 BURGER PROFILE =========================
 # ---- ON THE DAY: edit these three -------------------------------------------------------------------------------
-TIME_LIMIT = 600.0            # [s] time the organizers give for the mission (the robot plans its trip home with it)
+TIME_LIMIT = 1500.0           # [s] time the organizers give for the mission (the robot plans its trip home with it; it goes home at once when EXPECTED_TARGETS are reached)
 TARGET_COLOR = "red"          # colour to rescue: "red" "green" "orange" "purple", several as ("red", "orange"), or "any"
 EXPECTED_TARGETS = 2          # two red apples: go home as soon as both are reached (None = unknown number -> explore everything)
 # ---- robot: TurtleBot3 Burger (Webots) --------------------------------------------------------------------------
@@ -158,9 +159,11 @@ GATE_MIN, GATE_K, GATE_REACHED = 0.30, 0.12, 0.30
 EXPLORE_FRAC = 0.80
 WP_TOL, WP_TOL_LAST, WP_TOL_HOME = 0.15, 0.08, 0.06
 LOOKAHEAD, DENSE_STEP = 0.5, 0.2
+MOVER_MIN_SPEED = 0.10        # the walking people in this world move at only 0.2 m/s
 NOVELTY_WIN = 100.0           # [s] go home when nothing new was seen for this long (slow robot: long)
-LOOK_BUDGET = 150.0
-FINE_BUDGET_OPEN = 120.0
+LOOK_BUDGET = 240.0           # [s] longest "go and look at floor the camera never saw" phase
+FINE_MIN_OPEN, FINE_BUDGET_OPEN = 80, 240.0   # then even small unseen corners (0.8 m2) are visited
+YOLO_COV_RANGE = 2.6          # floor counts as looked-at only within 2.6 m: the robot has to go INTO every room and corner
 USE_YOLO = True               # needs the ultralytics package and models/YOLO/yolo11n.pt; otherwise the colour detection is used
 # ===========================================================================
 import os as _os
@@ -1145,14 +1148,14 @@ class Agent:
     def moving_tracks(self):
         """People that are really walking: seen just now, tracked for a while, and they have actually travelled."""
         return [tr for tr in self.tracks if self.t - tr["seen"] < 0.4 and self.t - tr["born"] >= 0.2
-                and math.hypot(*tr["v"]) > 0.2]
+                and math.hypot(*tr["v"]) > MOVER_MIN_SPEED]
 
     def movers(self):
         """Walking people we have seen in the last 2.5 s: (x, y, vx, vy) extrapolated to now."""
         out = []
         for tr in self.tracks:
             age = self.t - tr["seen"]
-            if age < 2.5 and math.hypot(*tr["v"]) > 0.2 and self.t - tr["born"] >= 0.2:
+            if age < 2.5 and math.hypot(*tr["v"]) > MOVER_MIN_SPEED and self.t - tr["born"] >= 0.2:
                 out.append((tr["x"] + tr["v"][0] * age, tr["y"] + tr["v"][1] * age, tr["v"][0], tr["v"][1]))
         return out
 
@@ -1586,6 +1589,7 @@ class Agent:
         for use_people in ((True, False) if pmask is not None else (False,)):   # avoid people's paths if at all possible
             for lvl in LEVELS:                                  # widest clearance first
                 trav, fr = self.map.derive(win, rx, ry, lvl, unknown_ok)
+                trav_u, fr_u = trav, fr                         # the same without the people mask (for the goal hysteresis)
                 if use_people:
                     trav = trav & ~pmask
                     fr = fr & ~pmask
@@ -1599,7 +1603,7 @@ class Agent:
                 path = Mapper.bfs(trav, start, goal)
                 if path:
                     self.goal_is_look = bool(lg is not None and lg[path[-1][0], path[-1][1]] and not fr[path[-1][0], path[-1][1]])
-                    found.append((path, trav, fr, goal))
+                    found.append((path, trav, fr, goal, trav_u, fr_u))
                     if len(found) == 2:
                         break
             if found:
@@ -1607,20 +1611,24 @@ class Agent:
         if not found:
             self.dlog("plan(%s) found no route (window %s)" % (kind, win))
             return False
-        path, trav, fr, gmask = found[0]
+        path, trav, fr, gmask, trav_u, fr_u = found[0]
         if len(found) == 2 and len(path) * 1.0 > 1.35 * len(found[1][0]) + 20:   # wide route is a big detour
-            path, trav, fr, gmask = found[1]
+            path, trav, fr, gmask, trav_u, fr_u = found[1]
 
         dgoal = math.hypot(self.goal_xy[0] - rx, self.goal_xy[1] - ry) if self.goal_xy is not None else 0.0
         if kind == "EXPLORE" and self.goal_xy is not None and (dgoal > 1.0 or (t - self.goal_pick_t < 8.0 and dgoal > 0.35)):
             gx, gy = self.goal_xy                               # hysteresis: keep the old goal if it is still ahead of us and reasonable
             dg = np.hypot(X - gx, Y - gy)
-            g2 = (fr | gmask) & (dg < (1.0 if dgoal > 1.0 else 0.5))
+            g2 = (fr | fr_u | gmask) & (dg < (1.0 if dgoal > 1.0 else 0.5))     # (a passing person must not make us forget the goal)
             if g2.any():                                        # commit to the cell of the old goal, not to whatever frontier is nearest to us
                 ki = int(np.argmin(np.where(g2, dg, 1e9)))
                 g2 = np.zeros_like(g2)
                 g2.flat[ki] = True
                 p2 = Mapper.bfs(trav, start, g2)
+                if not p2 and trav_u is not trav:
+                    p2 = Mapper.bfs(trav_u, start, g2)
+                    if p2 and len(p2) <= 2.0 * len(path) + 50:
+                        trav = trav_u
                 if p2 and len(p2) <= 2.0 * len(path) + 50:
                     path = p2
 
@@ -1736,9 +1744,7 @@ class Agent:
         vmax = min(vmax, math.sqrt(2 * 1.5 * max(gap - 0.15, 0.0)))     # always able to stop before what we see
 
         if d_now < MARGIN:
-            vmax = min(vmax, 0.5, 0.42 * V_MAX)                     # tight spot: slow and careful
-        elif d_now < MARGIN + 0.12:
-            vmax = min(vmax, 0.65 * V_MAX)                          # narrow gap: no full speed (a jam at speed can fling the robot)
+            vmax = min(vmax, 0.5)                                   # tight spot: slow and careful
         back_ok = self.rear_cover and (d_now < 0.30 or near_dyn)                          # squeezed, or a person is close: may reverse
         v_lo = max(-0.3 if back_ok else 0.0, self.v - A_BRAKE * DW)
         v_hi = max(v_lo, min(vmax, self.v + A_V * DW))
@@ -1910,6 +1916,9 @@ class Agent:
             if self.state == "RETURN":
                 self.ret_mode = min(self.ret_mode + 1, 3)
                 self.log("repeatedly stuck on the way home -> fallback level %d" % self.ret_mode)
+        if self.state == "APPROACH" and self.cand and self.dist(self.cand["p"]) < 0.8:
+            self.reach_target(self.cand, "stuck right next to it")   # 0.8 m or less from the apple and nothing lets us closer: that counts
+            return
         if self.state == "APPROACH" and self.cand and n_here >= 2:
             self.skip_target(self.cand)                              # this target keeps getting us stuck: try later
             self.log("target unreachable right now -> will retry later")
@@ -2303,7 +2312,7 @@ class Agent:
             else:
                 self.near_home_t = None
             if hd < START_RADIUS:
-                if ALIGN_AT_START and abs(wrap(self.yaw)) > 0.05 and self.clear_now > 0.2:
+                if ALIGN_AT_START and abs(wrap(self.yaw)) > 0.05 and self.clear_now > (0.2 if abs(HL - HW) > 0.02 else 0.02):   # (a round robot turns on the spot in any gap)
                     self.state, self.align_until = "ALIGN", t + 8.0
                 else:
                     self.finish("back at start")
@@ -2320,7 +2329,7 @@ class Agent:
                     self.ret_best, self.ret_prog_t = 1e9, t
                     self.log("no progress toward start -> fallback level %d" % self.ret_mode)
                     self.replan_soon()
-        elif st == "EXPLORE" and self.goal_xy and t - self.goal_t0 > 45.0:
+        elif st == "EXPLORE" and self.goal_xy and t - self.goal_t0 > 45.0 * max(1.0, 0.48 / V_MAX):
             self.map.blacklist(*self.goal_xy)                       # chasing one frontier too long
             self.replan_soon()
 
@@ -2536,6 +2545,7 @@ class Agent:
 
     def run(self):
         errs = {}
+        self.dlog("detector: %s" % ("YOLO11n" if getattr(self, "yolo", None) is not None else "colour only (no YOLO)"))
         while self.robot.step(self.dt) != -1:
             try:
                 self._step()
