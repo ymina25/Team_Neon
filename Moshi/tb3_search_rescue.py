@@ -37,6 +37,11 @@ except ImportError:                                 # pragma: no cover
 # ============================== CONFIG ======================================
 DEBUG = True                  # write a compact once-per-half-second trace to debug_log.txt (next to this file)
 DEBUG_TRUTH = False           # log the true pose if the robot node has supervisor TRUE (never used for control)
+MAP_DISPLAY = "map_display"    # name of a Display device (robot extensionSlot: Display { name "map_display" width 300 height 300 }):
+                              # draws the live map, path, scan, targets. Does nothing when the world has no such Display. None = off
+MAP_PERIOD = 0.25             # [s] redraw period of that display (simulation time)
+MAP_SAVE = None               # debug: file name to save the display picture to (e.g. "map_view.png"), None = off
+MANUAL_KEYS = False           # True = WASD takes the wheels while a key is held (testing only; autonomy resumes when released)
 EXPECTED_TARGETS = None       # None = number of targets unknown -> explore everything reachable.
                               # int  = go home as soon as that many targets have been reached.
 TIME_LIMIT = 600.0            # [s] competition time budget; the trip home starts early enough to fit
@@ -397,10 +402,10 @@ class Mapper:
         ix, iy = ix - i0, iy - j0
         a0, b0 = max(ix - 8, 0), max(iy - 8, 0)
         sub = occ[a0:ix + 9, b0:iy + 9]
-        if sub.any():                                       # robot already close to something: shrink
+        if sub.any() and radius_m > 0.35:                   # big robot already close to something: shrink (a small one just uses the free patch below)
             ii, jj = np.nonzero(sub)
             d_occ = float(np.hypot(ii + a0 - ix, jj + b0 - iy).min()) * RES
-            radius_m = clip(min(radius_m, d_occ - 0.03), 0.35, radius_m)
+            radius_m = clip(min(radius_m, d_occ - 0.03), min(0.35, LEVELS[-1]), radius_m)      # (the floor scales with the robot)
         infl = dilate(occ, int(round(radius_m / RES)))
         free = (L <= 0.5) if unknown_ok else (L < -0.25)
         trav = free & ~infl
@@ -424,6 +429,8 @@ class Mapper:
         ix, iy = self.cell(x, y)
         a0, b0 = max(ix - R, 0), max(iy - R, 0)
         a1, b1 = min(ix + R + 1, GW), min(iy + R + 1, GH)
+        if a1 <= a0 or b1 <= b0:                                    # pose outside the map (thrown far away)
+            return 0
         un = (self.L[a0:a1, b0:b1] < -0.25) & ~self.cov[a0:a1, b0:b1]
         ii = (np.arange(a0, a1) - ix)[:, None]
         jj = (np.arange(b0, b1) - iy)[None, :]
@@ -546,6 +553,9 @@ class Agent:
         self.cand = None
         self.approach_t0 = 0.0
         self.appr_anchor, self.appr_fb = None, False
+        self.nudge_until = 0.0
+        self.manual_on = False
+        self.tight_fail = 0
         self.dwell_until = self.align_until = 0.0
         self.recover_until, self.recover_dir = 0.0, 1.0
         self.stuck_events = deque()
@@ -686,6 +696,7 @@ class Agent:
         if self.depth is not None:
             self.depth.enable(period)
         self.setup_yolo()
+        self.setup_map_display(r)
         print("Camera %s (%s), depth sensor: %s" % (self.cam.getName(), "recognition" if self.use_recog else ("YOLO11n" if self.yolo is not None else "colour detection"),
                                                     self.depth.getName() if self.depth else "none -> using LiDAR / floor geometry"))
 
@@ -1610,7 +1621,7 @@ class Agent:
                 g2 = np.zeros_like(g2)
                 g2.flat[ki] = True
                 p2 = Mapper.bfs(trav, start, g2)
-                if p2 and len(p2) <= 1.5 * len(path) + 30:
+                if p2 and len(p2) <= 2.0 * len(path) + 50:
                     path = p2
 
         cells = smooth_cells(path, trav)
@@ -1628,6 +1639,7 @@ class Agent:
         if kind == "LOOK":
             self.look_goal = newg
         self.arrived = False
+        self.tight_fail = 0
         return True
 
     def use_crumbs(self):
@@ -1724,7 +1736,9 @@ class Agent:
         vmax = min(vmax, math.sqrt(2 * 1.5 * max(gap - 0.15, 0.0)))     # always able to stop before what we see
 
         if d_now < MARGIN:
-            vmax = min(vmax, 0.5)                                   # tight spot: slow and careful
+            vmax = min(vmax, 0.5, 0.42 * V_MAX)                     # tight spot: slow and careful
+        elif d_now < MARGIN + 0.12:
+            vmax = min(vmax, 0.65 * V_MAX)                          # narrow gap: no full speed (a jam at speed can fling the robot)
         back_ok = self.rear_cover and (d_now < 0.30 or near_dyn)                          # squeezed, or a person is close: may reverse
         v_lo = max(-0.3 if back_ok else 0.0, self.v - A_BRAKE * DW)
         v_hi = max(v_lo, min(vmax, self.v + A_V * DW))
@@ -2001,6 +2015,115 @@ class Agent:
         self.state, self.sweep_turned, self.sweep_prev, self.sweep_until = "SWEEP", 0.0, self.yaw, self.t + 10.0
         self.log("360-degree look at (%.1f, %.1f)" % (self.x, self.y))
 
+    # ------------------------------------------------------------ live map on a Display + optional WASD
+    def setup_map_display(self, r):
+        self.mdisp, self.mdisp_wh, self.mdisp_t, self.kb = None, (0, 0), -99.0, None
+        try:
+            names = [r.getDeviceByIndex(i).getName() for i in range(r.getNumberOfDevices())]
+            if MAP_DISPLAY and MAP_DISPLAY in names:
+                d = r.getDevice(MAP_DISPLAY)
+                self.mdisp, self.mdisp_wh = d, (int(d.getWidth()), int(d.getHeight()))
+                print("Map display '%s' %dx%d: live map, path, LiDAR scan and targets" % (MAP_DISPLAY, *self.mdisp_wh))
+        except Exception as e:
+            print("Map display not available (%s)" % e)
+            self.mdisp = None
+        if MANUAL_KEYS:
+            try:
+                self.kb = r.getKeyboard()
+                self.kb.enable(self.dt)
+                print("WASD manual drive enabled (hold a key to take over; release to let the robot continue)")
+            except Exception as e:
+                print("Keyboard not available (%s)" % e)
+                self.kb = None
+
+    def update_map_display(self):
+        """Robot-centred picture (north up = start-frame +x right, +y up), auto-zoomed to everything known:
+        free floor dark grey, walls light grey, trail blue, planned path yellow, current scan orange, people pink,
+        apples on the floor orange, targets red (white when reached), start purple, robot green with its heading line."""
+        from controller import Display
+        W, H = self.mdisp_wh
+        M = self.map
+        x, y, c, s = self.x, self.y, math.cos(self.yaw), math.sin(self.yaw)
+        img = np.empty((H, W, 4), np.uint8)
+        img[:] = (0x11, 0x18, 0x27, 255)
+        ii, jj = np.nonzero(M.L > 1.0)
+        ox, oy = M.cx[ii], M.cy[jj]
+        fi, fj = np.nonzero(M.L < -0.25)
+        fx, fy = M.cx[fi], M.cy[fj]
+        tr = np.array(self.trail + [(x, y)], float).reshape(-1, 2)
+        P = self.scan_points(6.0)
+        sx, sy = x + c * P[:, 0] - s * P[:, 1], y + s * P[:, 0] + c * P[:, 1]
+        half_w, half_h = max(1.0, (W - 1) / 2 - 16), max(1.0, (H - 1) / 2 - 16)
+        sc = 0.02
+        for ax, ay in ((ox, oy), (tr[:, 0], tr[:, 1]), (sx, sy)):
+            if len(ax):
+                sc = max(sc, float(np.abs(ax - x).max()) / half_w, float(np.abs(ay - y).max()) / half_h)
+        k = max(1, int(round(RES / sc)))
+
+        def put(px_, py_, rgb, size=1):
+            if len(px_) == 0:
+                return
+            u = np.rint((W - 1) / 2 + (np.asarray(px_, float) - x) / sc).astype(np.int64)
+            v = np.rint((H - 1) / 2 - (np.asarray(py_, float) - y) / sc).astype(np.int64)
+            col = np.array([(rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255, 255], np.uint8)
+            lo, hi = -(size // 2), size - size // 2
+            for dv in range(lo, hi):
+                for du in range(lo, hi):
+                    uu, vv = u + du, v + dv
+                    ok = (uu >= 0) & (uu < W) & (vv >= 0) & (vv < H)
+                    img[vv[ok], uu[ok]] = col
+
+        put(fx, fy, 0x1F2937, k)
+        put(ox, oy, 0xE5E7EB, k)
+        put(tr[:, 0], tr[:, 1], 0x38BDF8)
+        if self.path:
+            pp = np.array(self.path[:80], float).reshape(-1, 2)
+            put(pp[:, 0], pp[:, 1], 0xFACC15)
+        put(sx, sy, 0xF59E0B)
+        if self.tracks:
+            put([tr_["x"] for tr_ in self.tracks], [tr_["y"] for tr_ in self.tracks], 0xF472B6, 3)
+        if self.objs:
+            put([o["p"][0] for o in self.objs], [o["p"][1] for o in self.objs], 0xFB923C, 3)
+        put([0.0], [0.0], 0xA855F7, 5)
+        for g in self.targets:
+            put([g["p"][0]], [g["p"][1]], 0xFFFFFF if g["status"] == "reached" else 0xEF4444, 7)
+            put([g["p"][0]], [g["p"][1]], 0xEF4444, 3)
+        hs = np.linspace(0.0, 0.4, 12)
+        put(x + hs * c, y + hs * s, 0x22C55E)
+        put([x], [y], 0x22C55E, 5)
+        ref = self.mdisp.imageNew(img.tobytes(), Display.RGBA, W, H)
+        self.mdisp.imagePaste(ref, 0, 0, False)
+        self.mdisp.imageDelete(ref)
+        if MAP_SAVE:
+            self.mdisp.imageSave(None, MAP_SAVE)
+
+    def manual_step(self):
+        """WASD: while a key is held it drives (returns True); nothing held -> False and the robot carries on by itself."""
+        keys = set()
+        k = self.kb.getKey()
+        while k != -1:
+            keys.add(k & 0xFFFF)
+            k = self.kb.getKey()
+        v = w = 0.0
+        if ord("W") in keys or ord("w") in keys:
+            v = 0.6 * V_MAX
+        elif ord("S") in keys or ord("s") in keys:
+            v = -0.6 * V_MAX
+        elif ord("A") in keys or ord("a") in keys:
+            w = 1.0
+        elif ord("D") in keys or ord("d") in keys:
+            w = -1.0
+        if v == 0.0 and w == 0.0:
+            if self.manual_on:                                      # key released: stop, forget the old plan, go on autonomously
+                self.manual_on = False
+                self.drive(0.0, 0.0)
+                self.path, self.last_plan, self.arrived = [], -99.0, False
+                self.hist.clear()
+            return False
+        self.manual_on = True
+        self.drive(v, w)
+        return True
+
     def tick(self):
         t = self.t
         st = self.state
@@ -2090,7 +2213,8 @@ class Agent:
                 self.nov.popleft()
             o = self.nov[0]
             pend = any(g["status"] == "pending" for g in self.targets)
-            if (t - o[0] >= NOVELTY_WIN and not pend and len(self.targets) == o[3]
+            missing = EXPECTED_TARGETS is not None and self.n_reached() < EXPECTED_TARGETS
+            if (t - o[0] >= NOVELTY_WIN and not pend and not missing and len(self.targets) == o[3]
                     and self.nov[-1][1] - o[1] < 250 and self.nov[-1][2] - o[2] < 400):
                 self.go_home("nothing new for %.0f s, %d target(s) reached" % (NOVELTY_WIN, self.n_reached()))
                 return
@@ -2137,7 +2261,15 @@ class Agent:
                 self.appr_anchor = here
             elif t - self.appr_anchor[0] > 6.0:
                 self.appr_anchor = None
-                if self.dist(tg["p"]) < 0.8:
+                dtg = self.dist(tg["p"])
+                if dtg < 0.8 and dtg > 0.34 and not tg.get("nudged"):
+                    tg["nudged"] = True                         # the map stops short of the target: last bit straight at it (the DWA still watches the scan)
+                    ux, uy = (tg["p"][0] - self.x) / dtg, (tg["p"][1] - self.y) / dtg
+                    self.path = [(tg["p"][0] - 0.25 * ux, tg["p"][1] - 0.25 * uy)]
+                    self.arrived, self.nudge_until = False, t + 6.0
+                    self.log("last bit: straight at the target (%.2f m away)" % dtg)
+                    return
+                if dtg < 0.8:
                     self.reach_target(tg, "as close as it gets")
                 else:
                     self.log("approach stalled %.1f m from the target -> will retry later" % self.dist(tg["p"]))
@@ -2203,6 +2335,8 @@ class Agent:
         # ---- (re)plan
         period = 1.3 if self.movers() else 2.5
         need = (not self.path) or (t - self.last_plan > period and st != "LOOK")
+        if st == "APPROACH" and t < self.nudge_until and self.path:
+            need = False                                        # finishing the last bit: do not replan it away
         if not need and self.step_i % 16 == 0:
             need = self.path_blocked()
         if need and not (st == "RETURN" and self.ret_mode >= 2 and self.path and t - self.last_plan < 6.0):
@@ -2212,6 +2346,13 @@ class Agent:
                 if st == "EXPLORE":
                     if t < 3.0:
                         self.drive(0, 0.5)                          # look around while the map fills
+                    elif self.clear_now < 0.40 and self.tight_fail < 5:
+                        # no route from where we stand, and something is right next to us: that is the spot's fault, not proof that the
+                        # map is done. Back out of it, then plan again (never conclude "exploration complete" from here).
+                        self.tight_fail += 1
+                        self.log("no route from a tight spot -> backing out and planning again (%d)" % self.tight_fail)
+                        self.recover_until, self.recover_dir = t + 2.0, (1.0 if self.tight_fail % 2 else -1.0)
+                        self.prev_state, self.state = "EXPLORE", "RECOVER"
                     elif (self.look_first is None or t - self.look_first < LOOK_BUDGET) and self.plan("LOOK", t):
                         # LiDAR frontiers are gone: go and look at what the camera never saw
                         self.state, self.look_t0 = "LOOK", t
@@ -2394,49 +2535,72 @@ class Agent:
             self.log("TEST: robot teleported by (%.1f, %.1f) m" % (dx, dy))
 
     def run(self):
+        errs = {}
         while self.robot.step(self.dt) != -1:
-            self.t = self.robot.getTime()
-            self.step_i += 1
-            self.test_teleport()
-            self.odometry()
-            if math.hypot(self.x - self.crumbs[-1][0], self.y - self.crumbs[-1][1]) > 0.4:
-                self.crumbs.append((self.x, self.y))
-            if self.step_i % 2 == 0:
-                for l in self.lidars:
-                    l.read()
-                self.update_contact()
-                flung = self.detect_fling()
-                if self.flung_pending and not flung:                # it has come to rest: find out where it landed
-                    self.flung_pending = False
-                    self.global_relocalize("thrown or shoved")
-                shoved = self.contact_t is not None or flung        # being pushed: the pose is unreliable, keep the map clean
-                if not shoved and self.step_i % 8 == 0 and abs(self.yaw_rate) < 3.0:
-                    self.remember_scan()
-                if USE_SCAN_MATCH and self.step_i % 8 == 0 and not shoved:
-                    self.scan_match()
-                self.detect_dynamic()
-                for l in (self.lidars if not shoved else []):
-                    self.map.update(self.x + l.mx * math.cos(self.yaw),
-                                    self.y + l.mx * math.sin(self.yaw), self.yaw, l)
-                cam_new = self.camera_fresh()
-                if self.state in ("EXPLORE", "APPROACH", "LOOK", "SWEEP") and (cam_new if CAM_SYNC else self.step_i % 4 == 0):
-                    self.update_camera()
+            try:
+                self._step()
+            except Exception as e:                                  # a bug in one step must never stop the robot for good
+                key = "%s:%s" % (type(e).__name__, str(e)[:60])
+                errs[key] = errs.get(key, 0) + 1
+                if errs[key] <= 3:
+                    import traceback
+                    print("step error (%d): %s" % (errs[key], traceback.format_exc()))
+                try:
+                    self.brake()
+                except Exception:
+                    pass
+
+    def _step(self):
+        self.t = self.robot.getTime()
+        self.step_i += 1
+        self.test_teleport()
+        self.odometry()
+        if math.hypot(self.x - self.crumbs[-1][0], self.y - self.crumbs[-1][1]) > 0.4:
+            self.crumbs.append((self.x, self.y))
+        if self.step_i % 2 == 0:
+            for l in self.lidars:
+                l.read()
+            self.update_contact()
+            flung = self.detect_fling()
+            if self.flung_pending and not flung:                # it has come to rest: find out where it landed
+                self.flung_pending = False
+                self.global_relocalize("thrown or shoved")
+            shoved = self.contact_t is not None or flung        # being pushed: the pose is unreliable, keep the map clean
+            if not shoved and self.step_i % 8 == 0 and abs(self.yaw_rate) < 3.0:
+                self.remember_scan()
+            if USE_SCAN_MATCH and self.step_i % 8 == 0 and not shoved:
+                self.scan_match()
+            self.detect_dynamic()
+            for l in (self.lidars if not shoved else []):
+                self.map.update(self.x + l.mx * math.cos(self.yaw),
+                                self.y + l.mx * math.sin(self.yaw), self.yaw, l)
+            cam_new = self.camera_fresh()
+            if self.state in ("EXPLORE", "APPROACH", "LOOK", "SWEEP") and (cam_new if CAM_SYNC else self.step_i % 4 == 0):
+                self.update_camera()
+            if self.kb is None or not self.manual_step():
                 self.tick()
-            if self.step_i % 25 == 0:
-                self.trail.append((self.x, self.y))
-            if self.persons and self.step_i % 2 == 0:
-                self.check_person_contact()
-            if DEBUG and self.t - self.dbg_t >= 0.5:
-                self.dbg_t = self.t
-                self.debug_line()
-                if int(self.t) % 60 == 59 and self.t - self.dump_t > 5.0:
-                    self.dump_t = self.t
-                    self.debug_dump("t")
-            if self.t - self.log_t > 5.0:
-                self.log_t = self.t
-                self.log("pose (%.1f, %.1f, %.0f deg) targets %d/%d seen | v=%.2f m/s clearance=%.2fm path=%d"
-                         % (self.x, self.y, math.degrees(self.yaw), self.n_reached(), len(self.targets),
-                            self.v, self.clear_now, len(self.path)))
+        if self.mdisp is not None and self.t - self.mdisp_t >= MAP_PERIOD:
+            self.mdisp_t = self.t
+            try:
+                self.update_map_display()
+            except Exception as e:                              # a picture must never stop the robot
+                print("map display off (%r)" % (e,))
+                self.mdisp = None
+        if self.step_i % 25 == 0:
+            self.trail.append((self.x, self.y))
+        if self.persons and self.step_i % 2 == 0:
+            self.check_person_contact()
+        if DEBUG and self.t - self.dbg_t >= 0.5:
+            self.dbg_t = self.t
+            self.debug_line()
+            if int(self.t) % 60 == 59 and self.t - self.dump_t > 5.0:
+                self.dump_t = self.t
+                self.debug_dump("t")
+        if self.t - self.log_t > 5.0:
+            self.log_t = self.t
+            self.log("pose (%.1f, %.1f, %.0f deg) targets %d/%d seen | v=%.2f m/s clearance=%.2fm path=%d"
+                     % (self.x, self.y, math.degrees(self.yaw), self.n_reached(), len(self.targets),
+                        self.v, self.clear_now, len(self.path)))
 
 
 if __name__ == "__main__":
