@@ -93,6 +93,8 @@ MOVER_MIN_SPEED = 0.20         # [m/s] a tracked thing must move faster than thi
 SWEEP_MIN = 600               # [cells] same, for a quick look on the spot while exploring
 SWEEP_GAP = 5.0               # [m] minimum distance between two 360-degree looks
 SWEEP_W = 1.8                 # [rad/s] turn rate during a 360-degree look
+BLK_TTL = 100.0               # [s] a frontier the robot gave up on is tried again after this long
+MAX_SEARCH_PASSES = 3         # with EXPECTED_TARGETS set: how often the whole map is searched again when targets are still missing
 EXPLORE_MAX = None            # [s] hard cap on searching: after this the robot always heads home (None = EXPLORE_FRAC * TIME_LIMIT)
 EXPLORE_FRAC = 0.55           # share of TIME_LIMIT that may be spent searching (the trip home is budgeted separately)
 TRAVEL_V = None               # [m/s] typical driving speed used to estimate the way home (None = the lower of 0.6 and 85% of V_MAX)
@@ -111,6 +113,9 @@ CAM_LAG = 0.0                 # [s] the camera image is this much older than the
 # --- YOLO object detector (Ultralytics YOLO11n, runs on the CPU).  Used for the targets when the package and the model file are found;
 #     otherwise the rule-based colour detection above is used.
 USE_YOLO = False               # True = detect the targets with YOLO (apples / balls).  Off here: the boxes of the MiR / practice worlds are not COCO objects
+YOLO_DISPLAY = "yolo_display"  # Webots Display that shows the camera picture with ALL YOLO boxes, labels and confidences
+                              # (robot extensionSlot: Display { name "yolo_display" width 320 height 240 }); does nothing when the world has none. None = off
+YOLO_SAVE = None              # debug: file name to save the YOLO display picture to
 YOLO_MODEL = None             # path to yolo11n.pt.  None = look for ../../models/YOLO/yolo11n.pt (the competition layout), then next to this file
 YOLO_CLASSES = (32, 47, 49)   # COCO classes accepted as a target: 32 sports ball, 47 apple, 49 orange  (a small apple is often called 'sports ball').  None = all
 YOLO_CONF = 0.20              # minimum confidence
@@ -156,13 +161,15 @@ SELF_MASK_M = 0.0
 LIDAR_USE = 3.5
 TARGET_LIDAR_VISIBLE = False  # apples are lower than the LiDAR plane
 GATE_MIN, GATE_K, GATE_REACHED = 0.30, 0.12, 0.30
-EXPLORE_FRAC = 0.80
+EXPLORE_FRAC = 0.88
 WP_TOL, WP_TOL_LAST, WP_TOL_HOME = 0.15, 0.08, 0.06
 LOOKAHEAD, DENSE_STEP = 0.5, 0.2
 MOVER_MIN_SPEED = 0.10        # the walking people in this world move at only 0.2 m/s
 NOVELTY_WIN = 100.0           # [s] go home when nothing new was seen for this long (slow robot: long)
-LOOK_BUDGET = 240.0           # [s] longest "go and look at floor the camera never saw" phase
-FINE_MIN_OPEN, FINE_BUDGET_OPEN = 80, 240.0   # then even small unseen corners (0.8 m2) are visited
+LOOK_BUDGET = 600.0           # [s] "go and look at floor the camera never saw": as long as it takes (the time budget still ends it)
+LOOK_MIN, SWEEP_MIN = 250, 400   # [cells of 0.01 m2] even a 2.5 m2 patch of never-seen floor is worth a trip / a 360-degree look
+FINE_MIN_OPEN, FINE_BUDGET_OPEN = 25, 600.0   # then every small unseen corner (0.25 m2) is visited too
+MAX_SEARCH_PASSES = 6         # both apples not found although everything was seen: forget what was 'seen' and go round the whole map again
 YOLO_COV_RANGE = 2.6          # floor counts as looked-at only within 2.6 m: the robot has to go INTO every room and corner
 USE_YOLO = True               # needs the ultralytics package and models/YOLO/yolo11n.pt; otherwise the colour detection is used
 # ===========================================================================
@@ -323,6 +330,7 @@ class Mapper:
         self.L = np.zeros((GW, GH), np.float32)             # log-odds, exactly 0 = unknown
         self.ts = np.arange(0.15, LIDAR_USE, 0.08)
         self.blk = np.zeros((GW, GH), bool)                 # blacklisted frontier area
+        self.blk_log, self.now = [], 0.0                    # (time, x, y, r) of every blacklisting: they expire
         self.obs_pts = []                                   # centres of small objects below the LiDAR plane
         self.cov = np.zeros((GW, GH), bool)                 # floor the CAMERA has looked at
         self.vpvis = np.zeros((GW, GH), bool)               # floor that was in open view of a place where we did a 360-degree look
@@ -442,6 +450,18 @@ class Mapper:
     def blacklist(self, x, y, r=7):
         ix, iy = self.cell(x, y)
         self.blk[max(ix - r, 0):ix + r + 1, max(iy - r, 0):iy + r + 1] = True
+        self.blk_log.append((self.now, x, y, r))
+
+    def expire_blk(self, ttl):
+        """A frontier that was given up on (stuck, too far, a person in the way) is tried again after `ttl` seconds."""
+        if not self.blk_log or self.now - self.blk_log[0][0] < ttl:
+            return
+        keep = [e for e in self.blk_log if self.now - e[0] < ttl]
+        self.blk[:] = False
+        self.blk_log = []
+        for _, x, y, r in keep:
+            self.blacklist(x, y, r)
+        self.blk_log = [(e[0], e[1], e[2], e[3]) for e in keep]
 
     @staticmethod
     def bfs(trav, start, goal):
@@ -559,6 +579,7 @@ class Agent:
         self.nudge_until = 0.0
         self.manual_on = False
         self.tight_fail = 0
+        self.search_pass = 0
         self.dwell_until = self.align_until = 0.0
         self.recover_until, self.recover_dir = 0.0, 1.0
         self.stuck_events = deque()
@@ -699,6 +720,7 @@ class Agent:
         if self.depth is not None:
             self.depth.enable(period)
         self.setup_yolo()
+        self.setup_yolo_display(r)
         self.setup_map_display(r)
         print("Camera %s (%s), depth sensor: %s" % (self.cam.getName(), "recognition" if self.use_recog else ("YOLO11n" if self.yolo is not None else "colour detection"),
                                                     self.depth.getName() if self.depth else "none -> using LiDAR / floor geometry"))
@@ -1368,7 +1390,8 @@ class Agent:
             return out
         img = np.frombuffer(self.cam.getImage(), np.uint8).reshape(self.ch, self.cw, 4)
         rgbf = img[..., 2::-1].astype(np.float32)                  # RGB
-        if TARGET_LIST:                                             # cheap pre-check: no pixel of the wanted colour anywhere -> nothing to find
+        show = self.ydisp is not None                               # a YOLO picture is wanted: run the detector on every frame
+        if TARGET_LIST and not show:                                # cheap pre-check: no pixel of the wanted colour anywhere -> nothing to find
             small = rgbf[::2, ::2]
             if int((self.colour_match(small, 0.6) & (small.sum(axis=-1) > 60)).sum()) < 3:
                 return out
@@ -1376,13 +1399,17 @@ class Agent:
         bgr = np.ascontiguousarray(img[..., :3])
         try:
             res = self.yolo.predict(source=bgr, imgsz=YOLO_IMGSZ, conf=YOLO_CONF, iou=0.5, verbose=False, device="cpu",
-                                    classes=list(YOLO_CLASSES) if YOLO_CLASSES else None)[0]
+                                    classes=None if (show or not YOLO_CLASSES) else list(YOLO_CLASSES))[0]
         except Exception as e:
             self.dlog("YOLO failed: %s" % e)
             return out
         self.yolo_n += 1
+        if show:
+            self.update_yolo_display(res, bgr, rgbf)
         moving = self.contact_t is not None or self.t - self.contact_last < 1.5 or self.t - self.flung_t < 2.0
         for b in res.boxes:
+            if YOLO_CLASSES and int(b.cls[0]) not in YOLO_CLASSES:
+                continue                                            # (shown on the display, but not a possible target)
             conf = float(b.conf[0])
             x1, y1, x2, y2 = [float(v) for v in b.xyxy[0]]
             w, h = x2 - x1, y2 - y1
@@ -1929,6 +1956,30 @@ class Agent:
             self.state = state
         self.path, self.last_plan, self.arrived = [], -99.0, False
 
+    def restart_search(self, t):
+        """All frontiers and unseen corners are used up but fewer targets than expected were found: forget what was 'seen' and
+        'given up on' and search the whole map again (a target hides where the camera did not really look)."""
+        if EXPECTED_TARGETS is None or self.n_reached() >= EXPECTED_TARGETS:
+            return False
+        if self.search_pass >= MAX_SEARCH_PASSES or t > self.explore_max - 90.0 or self.budget_left() < 150.0:
+            return False
+        self.search_pass += 1
+        self.log("only %d of %d targets found and nothing left to explore -> searching the whole map again (pass %d)"
+                 % (self.n_reached(), EXPECTED_TARGETS, self.search_pass))
+        self.map.blk[:] = False
+        self.map.blk_log = []
+        self.map.cov[:] = False
+        self.map.vpvis[:] = False
+        self.vp_done, self.vp_real, self.vp_swept = [], set(), []
+        for g in self.targets:
+            if g["status"] == "skipped":
+                g["status"], g["skips"] = "pending", 0
+        self.retry_done, self.fine_look, self.look_first = False, False, None
+        self.last_sweep_t = -99.0
+        self.goal_xy = None
+        self.replan_soon("EXPLORE")
+        return True
+
     def go_home(self, why):
         self.log("returning to start (%s)" % why)
         if _os.environ.get("MIR_DUMPMAP"):
@@ -2023,6 +2074,92 @@ class Agent:
             self.map.mark_vp(self.x, self.y, SWEEP_GAP)
         self.state, self.sweep_turned, self.sweep_prev, self.sweep_until = "SWEEP", 0.0, self.yaw, self.t + 10.0
         self.log("360-degree look at (%.1f, %.1f)" % (self.x, self.y))
+
+    # ------------------------------------------------------------ YOLO picture with bounding boxes on a Display
+    def setup_yolo_display(self, r):
+        self.ydisp = None
+        if not YOLO_DISPLAY or getattr(self, "yolo", None) is None:
+            return
+        try:
+            names = [r.getDeviceByIndex(i).getName() for i in range(r.getNumberOfDevices())]
+        except Exception:
+            names = []
+        if YOLO_DISPLAY not in names:
+            print("YOLO display: no Display named '%s' in the world (add Display { name \"%s\" width 320 height 240 } to the robot) -> no boxes shown" % (YOLO_DISPLAY, YOLO_DISPLAY))
+            return
+        self.ydisp = r.getDevice(YOLO_DISPLAY)
+        print("YOLO display '%s': camera picture with all detected objects, labels and confidence" % YOLO_DISPLAY)
+
+    def target_colour_name(self, rgbf, x1, y1, x2, y2):
+        """Name of the wanted colour that this box has ('red' ...), or None when it is not a target colour."""
+        cx, cy, hw, hh = 0.5 * (x1 + x2), 0.5 * (y1 + y2), 0.35 * (x2 - x1), 0.35 * (y2 - y1)
+        patch = rgbf[int(max(cy - hh, 0)):int(min(cy + hh + 1, self.ch)), int(max(cx - hw, 0)):int(min(cx + hw + 1, self.cw))]
+        if patch.size == 0:
+            return None
+        names = TARGET_COLOR if isinstance(TARGET_COLOR, (tuple, list)) else []
+        for n in names:
+            rgb = COLOR_TABLE.get(str(n).lower()) if isinstance(n, str) else tuple(n)
+            if rgb is not None and float(self.color_close(patch, YOLO_COLOR_TOL, rgb).mean()) >= YOLO_COLOR_MIN:
+                return str(n) if isinstance(n, str) else "target"
+        if not names and float(self.colour_match(patch, YOLO_COLOR_TOL).mean()) >= YOLO_COLOR_MIN:
+            return "target"
+        return None
+
+    def draw_yolo_frame(self, result, bgr, rgbf):
+        """Camera picture with all boxes.  A sports ball / apple / orange box in the wanted colour is drawn green and labelled
+        '<colour> apple' (YOLO itself often calls a small apple 'sports ball'); every other object keeps YOLO's own name."""
+        import cv2
+        frame = np.ascontiguousarray(bgr).copy()
+        self._had_tgt = False
+        names = result.names
+        for b in result.boxes:
+            cls, conf = int(b.cls[0]), float(b.conf[0])
+            x1, y1, x2, y2 = [int(round(float(v))) for v in b.xyxy[0]]
+            nm = names[cls] if not isinstance(names, dict) else names.get(cls, str(cls))
+            col, label = (255, 160, 0), nm
+            if not YOLO_CLASSES or cls in YOLO_CLASSES:
+                cn = self.target_colour_name(rgbf, x1, y1, x2, y2)
+                if cn:
+                    col, label = (0, 220, 0), "%s apple" % cn
+                    self._had_tgt = True
+            cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
+            txt = "%s %.2f" % (label, conf)
+            (tw, th), base = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            ty = y1 - 4 if y1 - th - 6 > 0 else y2 + th + 4
+            cv2.rectangle(frame, (x1, ty - th - 3), (x1 + tw + 2, ty + base - 1), col, -1)
+            cv2.putText(frame, txt, (x1 + 1, ty - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+        return frame
+
+    def update_yolo_display(self, result, bgr=None, rgbf=None):
+        """Camera frame with every YOLO box (any class), fitted into the Display."""
+        if self.ydisp is None:
+            return
+        try:
+            from controller import Display
+            import cv2
+            if bgr is not None and rgbf is not None:
+                frame = self.draw_yolo_frame(result, bgr, rgbf)                       # BGR
+            else:
+                frame = result.plot(labels=True, conf=True, boxes=True, line_width=2)
+            dw, dh = self.ydisp.getWidth(), self.ydisp.getHeight()
+            fh, fw = frame.shape[:2]
+            sc = min(dw / fw, dh / fh)
+            w2, h2 = max(1, round(fw * sc)), max(1, round(fh * sc))
+            small = cv2.resize(frame, (w2, h2), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR)
+            canvas = np.zeros((dh, dw, 3), np.uint8)
+            left, top = (dw - w2) // 2, (dh - h2) // 2
+            canvas[top:top + h2, left:left + w2] = small
+            rgb = np.ascontiguousarray(canvas[..., ::-1])
+            ref = self.ydisp.imageNew(rgb.tobytes(), Display.RGB, dw, dh)
+            try:
+                self.ydisp.imagePaste(ref, 0, 0, False)
+            finally:
+                self.ydisp.imageDelete(ref)
+            if YOLO_SAVE:
+                self.ydisp.imageSave(None, YOLO_SAVE.replace(".png", "_target.png") if getattr(self, "_had_tgt", False) else YOLO_SAVE)
+        except Exception as e:
+            print("YOLO display off (%r)" % (e,))
+            self.ydisp = None
 
     # ------------------------------------------------------------ live map on a Display + optional WASD
     def setup_map_display(self, r):
@@ -2375,10 +2512,13 @@ class Agent:
                         self.log("nothing left to look at -> second pass")
                         self.retry_done = True
                         self.map.blk[:] = False
+                        self.map.blk_log = []
                         for g in self.targets:
                             if g["status"] == "skipped":
                                 g["status"] = "pending"
                         self.last_plan = t - 1.5
+                    elif self.restart_search(t):
+                        pass
                     else:
                         left = [g for g in self.targets if g["status"] != "reached"]
                         self.go_home("exploration complete, %d target(s) found%s"
@@ -2562,7 +2702,10 @@ class Agent:
 
     def _step(self):
         self.t = self.robot.getTime()
+        self.map.now = self.t
         self.step_i += 1
+        if self.step_i % 40 == 0:
+            self.map.expire_blk(BLK_TTL)
         self.test_teleport()
         self.odometry()
         if math.hypot(self.x - self.crumbs[-1][0], self.y - self.crumbs[-1][1]) > 0.4:
